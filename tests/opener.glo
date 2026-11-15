@@ -1,0 +1,102 @@
+//! Native Windows opener boundary; the fake executor never starts an application.
+Opener :: #import "../src/opener.glo";
+#import "Strings/Utf8";
+#import "Strings/Utf16";
+#import "Io";
+#import "Process";
+#import "Meta";
+
+kernel :: #library,system "kernel32";
+ole :: #library,system "ole32";
+set_last_error :: (code: u32) #foreign kernel "SetLastError";
+initialize_com :: (reserved: usize, flags: u32) -> s32 #foreign ole "CoInitializeEx";
+uninitialize_com :: () #foreign ole "CoUninitialize";
+checks: s64;
+calls: s64;
+expected_target: str;
+fail_executor: bool;
+
+expect :: (condition: bool, message: str) {
+    checks += 1;
+    if !condition {
+        print("opener check failed: {}\n", message);
+        exit(1);
+    }
+}
+
+check_dispatch :: (info: *Opener.Launch_Info) -> s32 {
+    calls += 1;
+    expect(info.cbSize == cast(u32) size_of(Opener.Launch_Info), "native structure size");
+    expect(info.fMask == 16#500, "no UI and synchronous association handoff flags");
+    expect(info.hwnd == 0 && info.lpVerb == 0, "default application verb without an owner window");
+    expect(info.lpParameters == 0 && info.lpDirectory == 0, "no command arguments or directory interpolation");
+    expect(info.nShow == 1, "normal application activation");
+    expect(info.lpIDList == 0 && info.lpClass == 0 && info.hkeyClass == 0 && info.dwHotKey == 0 &&
+           info.hIcon == 0 && info.hProcess == 0, "unused native fields are initialized");
+    expect(info.lpFile != 0, "target pointer is present");
+    actual := cast([*]const u16) info.lpFile;
+    expected := expected_target.utf16_from_string();
+    defer expected.free();
+    for i: 0..expected.count {
+        if actual[i] != expected.data[i]
+            print("target unit mismatch: {} at {}: actual {} expected {}\n", expected_target, i, actual[i], expected.data[i]);
+        expect(actual[i] == expected.data[i], "literal UTF-16 target units");
+    }
+    expect(actual[expected.count] == 0, "UTF-16 target is terminated");
+    if fail_executor {
+        set_last_error(2);
+        return 0;
+    }
+    return 1;
+}
+fake_execute :: (info: *Opener.Launch_Info) -> s32 #c_call { return check_dispatch(info); }
+
+main :: () -> s32 {
+    #if OUT.os != .Windows {
+        print("SKIP: Windows opener native boundary\n");
+        return 0;
+    }
+    #if size_of(usize) == 8 expect(size_of(Opener.Launch_Info) == 112, "Win64 SHELLEXECUTEINFOW ABI");
+    for target: .["relative folder\\literal ; & $ | name.txt", "C:\\한글 😀 é\\name \"quoted\".txt",
+                    "https://example.invalid/a path?q=x&literal=%22#fragment", ".", "--literal-option"] {
+        expected_target = target;
+        before := calls;
+        outcome := Opener.open_with_executor(target, fake_execute);
+        defer outcome.error.free();
+        expect(outcome.ok && outcome.error.count == 0, "native dispatch succeeds");
+        expect(calls == before + 1, "one OS handoff per target");
+    }
+    for target: .["", "nul\x00suffix"] {
+        before := calls;
+        outcome := Opener.open_with_executor(target, fake_execute);
+        defer outcome.error.free();
+        expect(!outcome.ok && outcome.error.count > 0, "invalid target reports an error");
+        expect(calls == before, "invalid target never reaches OS executor");
+    }
+    // Glosso string escapes encode Unicode scalars, so construct malformed
+    // UTF-8 as byte slices rather than spelling them as string escapes.
+    invalid_bytes: [6]u8 = .[255, 192, 175, 237, 160, 128];
+    for bytes: .[invalid_bytes[0..1], invalid_bytes[1..3], invalid_bytes[3..6]] {
+        before := calls;
+        outcome := Opener.open_with_executor(bytes.byte_slice_to_string(), fake_execute);
+        defer outcome.error.free();
+        expect(!outcome.ok && outcome.error.count > 0, "malformed UTF-8 reports an error");
+        expect(calls == before, "malformed UTF-8 never reaches OS executor");
+    }
+    expected_target = "missing literal 한글.txt";
+    fail_executor = true;
+    failure := Opener.open_with_executor(expected_target, fake_execute);
+    defer failure.error.free();
+    expect(!failure.ok && failure.error.count > 0, "native OS failure propagates");
+    // A caller-owned MTA must survive the helper's attempted STA setup.
+    expect(initialize_com(0, 0) >= 0, "test MTA initializes");
+    defer uninitialize_com();
+    fail_executor = false;
+    preserved := Opener.open_with_executor(expected_target, fake_execute);
+    defer preserved.error.free();
+    expect(preserved.ok, "handoff works with an existing MTA");
+    expect(initialize_com(0, 0) == 1, "caller COM apartment remains initialized");
+    uninitialize_com();
+    print("{} native opener checks passed\n", checks);
+    return 0;
+}

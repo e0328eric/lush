@@ -1,0 +1,129 @@
+//! Default Lua configuration, embedded in the executable and created once.
+#import "File_System/Directory";
+#import "File_System/Path";
+#import "File_System/File";
+#import "File_System/Metadata";
+#import "File_System/Atomic";
+#import "File_System/Temporary";
+#import "Strings/Utf8";
+#import "Format";
+#import "Io";
+#import "Process";
+
+template_source :: () -> str {
+    path := path_join(path_dirname(#source_location.filename), "default_init.lua");
+    if read_file(path) == {
+    case .Ok(source); return source;
+    case .Err(error);
+        print("could not embed default configuration: {}\n", error.kind.reason());
+        exit(1);
+    }
+}
+
+#public {
+
+DEFAULT_INIT :: #comptime template_source();
+
+default_path :: () -> str {
+    if #pattern ?directory = get_config_dir() {
+        defer directory.free();
+        native := directory.to_string();
+        defer native.free();
+        return path_join(native, "lush", "init.lua");
+    }
+    empty: str;
+    return empty;
+}
+
+// Empty on success; otherwise an owned diagnostic. Never replace user content.
+create_if_missing :: (path: str, contents: str) -> str {
+    empty: str;
+    if path.count == 0 return empty;
+    if metadata(path, .follow_symlink = false) == {
+    case .Ok(info);
+        if info.kind == .Regular || info.kind == .Symlink return empty;
+        return tprint("configuration {} is not a regular file", path).clone();
+    case .Err(error);
+        if error.kind != .Not_Found
+            return tprint("could not inspect configuration {}: {}", path, error.kind.reason()).clone();
+    }
+    parent := path_dirname(path);
+    if parent.count == 0 parent = ".";
+    if #pattern .Err(error) = create_directory(parent,
+        .permissions = .Owner_Read | .Owner_Write | .Owner_Execute, .make_parent = true)
+        return tprint("could not create configuration directory {}: {}", parent, error.kind.reason()).clone();
+    // Publish the complete template without replacement, including when two
+    // shells start together. Rename checks the final entry without following
+    // a symbolic link another process may have created in the meantime.
+    staged: Temporary_File;
+    if Temporary_File.create_temporary_file(parent, .prefix = ".init-", .suffix = ".tmp") == {
+    case .Ok(file); staged = file;
+    case .Err(error);
+        return tprint("could not stage configuration {}: {}", path, error.kind.reason()).clone();
+    }
+    defer staged.free();
+    remaining := contents;
+    while remaining.count > 0 {
+        if staged.file.write(remaining) == {
+        case .Ok(written);
+            if written <= 0 return tprint("could not write configuration {}: no progress", path).clone();
+            remaining = remaining[written..];
+        case .Err(error);
+            return tprint("could not write configuration {}: {}", path, error.kind.reason()).clone();
+        }
+    }
+    if #pattern .Err(error) = staged.file.close()
+        return tprint("could not close configuration {}: {}", path, error.kind.reason()).clone();
+    if #pattern .Err(error) = atomic_replace(staged.path, path, .flags = .None) {
+        if error.kind != .Already_Exists
+            return tprint("could not create configuration {}: {}", path, error.kind.reason()).clone();
+        return empty;
+    }
+    staged.remove_on_close = false;
+    return empty;
+}
+
+ensure_default :: (path: str) -> str { return create_if_missing(path, DEFAULT_INIT); }
+
+// Theme definitions stay external Lua configuration, never compiled into Lush.
+// Seed missing user files from the distribution directory without replacing edits.
+install_theme_files :: (config_path: str, source_directory: str = "") -> str {
+    empty: str;
+    if config_path.count == 0 return empty;
+    bundle: str;
+    if source_directory.count > 0 bundle = source_directory.clone();
+    else {
+        executable := current_executable_path();
+        defer executable.free();
+        if executable.count == 0 return empty;
+        bundle = path_join(path_dirname(executable), "themes");
+    }
+    defer bundle.free();
+    if read_directory(bundle) == {
+    case .Err(error);
+        if error.kind == .Not_Found return empty;
+        return tprint("could not read theme configuration directory {}: {}", bundle, error.kind.reason()).clone();
+    case .Ok(entries);
+        defer entries.free();
+        for entry: entries.entries {
+            if !entry.name.ends_with(".lua") continue;
+            source := path_join(bundle, entry.name);
+            defer source.free();
+            if !is_regular_file(source).unwrap_or(false) continue;
+            target := path_join(path_dirname(config_path), "themes", entry.name);
+            defer target.free();
+            if #pattern .Ok(info) = metadata(target, .follow_symlink = false) continue;
+            if read_file(source) == {
+            case .Err(error);
+                return tprint("could not read theme configuration {}: {}", source, error.kind.reason()).clone();
+            case .Ok(contents);
+                defer contents.free();
+                error := create_if_missing(target, contents);
+                if error.count > 0 return error;
+            }
+        }
+    }
+    return empty;
+}
+
+}

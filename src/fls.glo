@@ -1,0 +1,270 @@
+//! Embedded fls: upstream views plus records with the same filtering/sorting.
+#import "Io";
+#import "Format";
+#import "Strings/Utf8";
+#import "Context";
+#import "Memory/Arena";
+#import "Memory/Ownership";
+#import "File_System/File";
+#import "File_System/System";
+#import "File_System/Directory";
+#import "File_System/Metadata";
+Options :: #import "../vendor/fls/src/options.glo";
+Cli :: #import "../vendor/fls/src/cli.glo";
+Entries :: #import "../vendor/fls/src/entry.glo";
+Theme :: #import "../vendor/fls/src/theme.glo";
+Git :: #import "../vendor/fls/src/git.glo";
+Util :: #import "../vendor/fls/src/util.glo";
+Tui :: #import "../vendor/fls/src/tui.glo";
+Lol :: #import "../vendor/fls/src/lol.glo";
+
+// Upstream resets its scratch storage between directories/animation frames.
+// Give each invocation its own arena so these resets preserve host temporaries.
+scratch_allocate :: (
+    data: ?*void, mode: Allocator_Mode, size: ssize, alignment: ssize,
+    old_memory: ?*void, old_size: ssize
+) -> ?*void {
+    #pattern ?pointer := data else { return null; };
+    arena := cast(*Arena) pointer;
+    if mode == .Free_All { arena.clear(); return null; }
+    base := arena.allocator();
+    #pattern ?procedure := base.procedure else { return null; };
+    return procedure(base.data, mode, size, alignment, old_memory, old_size);
+}
+
+scratch_allocator :: (arena: *Arena) -> Allocator {
+    return .{ .procedure = scratch_allocate, .data = cast(*void) arena };
+}
+
+reset_globals :: () {
+    Theme.reset_theme();
+    Git.reset_git();
+    Util.reset_util();
+}
+
+has_flag :: (args: []const str, prefix: str) -> bool {
+    for arg: args if arg.starts_with(prefix) return true;
+    return false;
+}
+
+valid_arguments :: (args: []const str) -> bool {
+    for arg: args if arg.has_nul() return false;
+    return true;
+}
+
+#public {
+
+// Arguments exclude an executable name, exactly as ls("-l", "path").
+run :: (args: []const str) -> s32 {
+    arena := Arena.new();
+    defer arena.free();
+    previous_scratch := context.temp_allocator;
+    context.temp_allocator = scratch_allocator(&arena);
+    defer context.temp_allocator = previous_scratch;
+    defer reset_globals();
+    options: Options.Options;
+    defer Options.free_options(&options);
+    parsed := Options.parse_options(args, &options);
+    if !valid_arguments(args) || !parsed.ok {
+        message := ifx valid_arguments(args) parsed.message else "arguments cannot contain NUL bytes";
+        stderr := File.stderr();
+        _ := stderr.writef("fls: {}\nTry 'fls --help' for more information.\n", message);
+        return 3;
+    }
+    if options.help { print("{}", Options.usage_text()); return 0; }
+    if options.version { print("fls {}\n", Options.FLS_VERSION); return 0; }
+    if options.lol != .Off return Lol.run_lol(options.lol, options.snapshot, options.width);
+    if options.tui || options.snapshot {
+        if options.icons == .Never && !has_flag(args, "--icons") && !has_flag(args, "--no-icons")
+            options.icons = .Always;
+        return Tui.run_tui(&options, options.snapshot, options.keys);
+    }
+    return Cli.run_cli(&options);
+}
+
+Record :: struct {
+    name: str;
+    path: str;
+    kind: str;
+    size: s64;
+    modified: s64;
+    modified_valid: bool;
+    depth: s64;
+    git_x: u8;
+    git_y: u8;
+    link_target: str;
+}
+
+Record_List :: struct {
+    items: [..]Record;
+    error: str;
+    code: s32;
+}
+
+release_records :: (list: *Record_List) {
+    for item: list.items {
+        item.name.free();
+        item.path.free();
+        item.link_target.free();
+    }
+    list.items.free();
+    list.error.free();
+    list.* = .{};
+}
+
+records :: (args: []const str) -> Record_List {
+    arena := Arena.new();
+    defer arena.free();
+    previous_scratch := context.temp_allocator;
+    context.temp_allocator = scratch_allocator(&arena);
+    defer context.temp_allocator = previous_scratch;
+    defer reset_globals();
+    result: Record_List;
+    options: Options.Options;
+    defer Options.free_options(&options);
+    if !valid_arguments(args) {
+        result.code = 3;
+        result.error = "ls arguments cannot contain NUL bytes".clone();
+        return result;
+    }
+    parsed := Options.parse_options(args, &options);
+    if !parsed.ok {
+        result.code = 3;
+        result.error = parsed.message.clone();
+        return result;
+    }
+    if options.help || options.version || options.lol != .Off || options.tui || options.snapshot {
+        result.code = 3;
+        result.error = "help, version, animation and browser views produce terminal output, not file records".clone();
+        return result;
+    }
+    if options.paths.count == 0 options.paths.push(".");
+    files: [..]Entries.Entry;
+    defer files.free();
+    directories: [..]Entries.Entry;
+    defer directories.free();
+    for path: options.paths {
+        entry := Entries.entry_make(path, path, options.filter.dereference);
+        if !entry.stat_ok {
+            result.code = 2;
+            result.error = tprint("{}: {} (os error {})", path,
+                Util.os_error_text(entry.stat_code), entry.stat_code).clone();
+            entry.free();
+            return result;
+        }
+        if options.absolute {
+            if #pattern .Ok(resolved) = absolute(path) {
+                entry.name.free();
+                entry.name = resolved;
+            }
+        }
+        if entry.is_dir && !options.list_dirs directories.push(entry);
+        else files.push(entry);
+    }
+    Entries.sort_entries(files.view(), options.sort);
+    if options.tree {
+        roots: [..]Entries.Entry;
+        defer roots.free();
+        for *entry: files roots.push(value_take(entry));
+        for *entry: directories roots.push(value_take(entry));
+        Entries.sort_entries(roots.view(), options.sort);
+        for *entry: roots {
+            append_record(&result, entry, &options, 0);
+            if entry.is_dir && !options.list_dirs {
+                if !collect_directory(&result, entry.path, &options, 1) return result;
+            }
+        }
+    } else {
+        for *entry: files append_record(&result, entry, &options, 0);
+        for entry: directories {
+            if !collect_directory(&result, entry.path, &options, 0) return result;
+        }
+    }
+    return result;
+}
+
+}
+
+kind_name :: (entry: *Entries.Entry) -> str {
+    if entry.meta.kind == {
+    case .Directory; return "dir";
+    case .Regular; return "file";
+    case .Symlink; return "symlink";
+    case .Fifo; return "fifo";
+    case .Socket; return "socket";
+    case .Block_Device; return "block";
+    case .Character_Device; return "character";
+    else; return "other";
+    }
+}
+
+directory_size :: (path: str, depth: s64 = 0) -> s64 {
+    if depth > 64 return 0;
+    #pattern .Ok(list) := read_directory(path) else { return 0; };
+    defer list.free();
+    total: s64;
+    for item: list.entries {
+        child := Util.join_path(path, item.name);
+        defer child.free();
+        #pattern .Ok(meta) := metadata(child) else { continue; };
+        if meta.kind == .Directory total += directory_size(child, depth + 1);
+        else total += meta.size;
+    }
+    return total;
+}
+
+append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options.Options, depth: s64) {
+    record: Record;
+    record.name = entry.name.clone();
+    record.path = entry.path.clone();
+    record.link_target = entry.link_target.clone();
+    record.kind = kind_name(entry);
+    record.size = entry.meta.size;
+    record.modified = entry.meta.modified.seconds;
+    record.modified_valid = entry.meta.modified.valid;
+    record.depth = depth;
+    if options.total_size && entry.meta.kind == .Directory && entry.name != ".."
+        record.size = directory_size(entry.path);
+    if options.git {
+        directory := Util.parent_path(entry.path);
+        if entry.is_dir && (entry.name == "." || entry.path == ".") directory = entry.path;
+        if #pattern ?repo = Git.git_repo_for(directory) {
+            x, y := Git.git_status_of(repo, entry.path, entry.is_dir);
+            record.git_x = x;
+            record.git_y = y;
+        }
+    }
+    result.items.push(record);
+}
+
+collect_directory :: (result: *Record_List, path: str, options: *Options.Options, depth: s64) -> bool {
+    if options.tree && options.level >= 0 && depth > options.level return true;
+    if depth > 1024 {
+        result.code = 2;
+        result.error = "directory recursion exceeded 1024 levels".clone();
+        return false;
+    }
+    #pattern .Ok(found) := Entries.load_directory(path, &options.filter) else {
+        result.code = 2;
+        result.error = tprint("cannot read directory: {}", path).clone();
+        return false;
+    };
+    entries := found;
+    defer entries.free();
+    Entries.sort_entries(entries.view(), options.sort);
+    for *entry: entries {
+        append_record(result, entry, options, depth);
+        if options.tree && entry.stat_ok && entry.meta.kind == .Directory &&
+            entry.name != "." && entry.name != ".." {
+            if !collect_directory(result, entry.path, options, depth + 1) return false;
+        }
+    }
+    if !options.tree && options.recurse && (options.level < 0 || depth + 1 < options.level) {
+        for entry: entries {
+            if entry.stat_ok && entry.meta.kind == .Directory && entry.name != "." && entry.name != ".." {
+                if !collect_directory(result, entry.path, options, depth + 1) return false;
+            }
+        }
+    }
+    return true;
+}

@@ -1,0 +1,316 @@
+//! Configuration creation tests. Every write stays in an owned build temporary directory.
+Config :: #import "../src/configuration.glo";
+#import "File_System/Directory";
+#import "File_System/Path";
+#import "File_System/File";
+#import "File_System/Metadata";
+#import "File_System/Temporary";
+#import "Strings/Utf8";
+#import "Io";
+#import "Process";
+
+checks: s64;
+expect :: (condition: bool, message: str) {
+    checks += 1;
+    if !condition {
+        print("configuration check failed: {}\n", message);
+        exit(1);
+    }
+}
+
+ensure_ok :: (path: str) {
+    error := Config.ensure_default(path);
+    defer error.free();
+    if error.count > 0 print("configuration error: {}\n", error);
+    expect(error.count == 0, "configuration creation succeeds");
+}
+
+install_ok :: (config_path: str, source_directory: str) {
+    error := Config.install_theme_files(config_path, source_directory);
+    defer error.free();
+    if error.count > 0 print("theme installation error: {}\n", error);
+    expect(error.count == 0, "external theme installation succeeds");
+}
+
+expect_contents :: (path: str, expected: str, message: str) -> Fs_Error!s64 {
+    actual := read_file(path)?;
+    defer actual.free();
+    expect(actual == expected, message);
+    return .Ok(0);
+}
+
+check_theme_installation :: (root: str) -> Fs_Error!s64 {
+    bundle := path_join(root, "arbitrary-theme-bundle");
+    defer bundle.free();
+    _ := create_directory(bundle)?;
+    config := path_join(root, "theme-user", "init.lua");
+    defer config.free();
+    theme_directory := path_join(path_dirname(config), "themes");
+    defer theme_directory.free();
+    source := path_join(bundle, "aurora-custom.lua");
+    defer source.free();
+    target := path_join(theme_directory, "aurora-custom.lua");
+    defer target.free();
+    original :: "-- external user theme 한글\r\nlocal t = lush.theme\r\nreturn t.prompt{input={t.text('custom> ')}}\r\n";
+    _ := write_file(source, original)?;
+    unicode_source := path_join(bundle, "한글 theme.lua");
+    defer unicode_source.free();
+    unicode_target := path_join(theme_directory, "한글 theme.lua");
+    defer unicode_target.free();
+    unicode_contents :: "-- unicode file and byte preservation\r\nreturn {name='한글'}\x00preserved\n";
+    _ := write_file(unicode_source, unicode_contents)?;
+    readme := path_join(bundle, "README.md");
+    defer readme.free();
+    _ := write_file(readme, "ordinary documentation")?;
+    non_lua := path_join(bundle, "configuration.json");
+    defer non_lua.free();
+    _ := write_file(non_lua, "{}")?;
+    subdirectory := path_join(bundle, "nested.lua");
+    defer subdirectory.free();
+    _ := create_directory(subdirectory)?;
+    nested_file := path_join(subdirectory, "child.lua");
+    defer nested_file.free();
+    _ := write_file(nested_file, "return 'not recursively installed'")?;
+
+    expect(!exists(theme_directory).unwrap_or(false), "theme target starts absent");
+    install_ok(config, bundle);
+    expect(is_directory(theme_directory).unwrap_or(false), "theme target directory is created");
+    expect(!exists(config).unwrap_or(false), "installing themes does not create init.lua itself");
+    _ := expect_contents(target, original, "an arbitrary external Lua theme is copied byte for byte")?;
+    _ := expect_contents(unicode_target, unicode_contents, "Unicode names and all source bytes are preserved")?;
+    {
+        ignored := path_join(theme_directory, "README.md");
+        defer ignored.free();
+        expect(!exists(ignored).unwrap_or(false), "non-Lua documentation is ignored");
+        ignored_json := path_join(theme_directory, "configuration.json");
+        defer ignored_json.free();
+        expect(!exists(ignored_json).unwrap_or(false), "non-Lua data files are ignored");
+        ignored_directory := path_join(theme_directory, "nested.lua");
+        defer ignored_directory.free();
+        expect(!exists(ignored_directory).unwrap_or(false), "Lua-named directories are not copied");
+    }
+    install_ok(config, bundle);
+    _ := expect_contents(target, original, "repeated installation preserves an existing theme")?;
+    ensure_ok(config);
+    edited_init :: "-- user init\nthis need not be valid Lua\x00keep\r\n";
+    _ := write_file(config, edited_init)?;
+    edited_theme :: "-- edited external theme\nuser choices 한글\x00stay unchanged\r\n";
+    _ := write_file(target, edited_theme)?;
+    _ := write_file(source, "return 'new distribution version must not overwrite user changes'")?;
+    later_source := path_join(bundle, "another-independent.lua");
+    defer later_source.free();
+    _ := write_file(later_source, "return 'new theme'")?;
+    later_target := path_join(theme_directory, "another-independent.lua");
+    defer later_target.free();
+    install_ok(config, bundle);
+    _ := expect_contents(target, edited_theme, "updated distribution themes never overwrite an edited user theme")?;
+    _ := expect_contents(later_target, "return 'new theme'", "new arbitrary theme names are installed on a later run")?;
+    _ := expect_contents(config, edited_init, "theme installation does not overwrite existing init.lua")?;
+    ensure_ok(config);
+    _ := expect_contents(config, edited_init, "ensuring init after theme installation preserves user edits")?;
+
+    // Missing bundles and bundles without Lua files cause no configuration writes.
+    missing_bundle := path_join(root, "bundle-does-not-exist");
+    defer missing_bundle.free();
+    absent_config := path_join(root, "no-bundle-user", "init.lua");
+    defer absent_config.free();
+    install_ok(absent_config, missing_bundle);
+    expect(!exists(path_dirname(absent_config)).unwrap_or(false), "missing distribution is quietly skipped without creating a user directory");
+    install_ok("", bundle);
+    empty_bundle := path_join(root, "non-lua-bundle");
+    defer empty_bundle.free();
+    _ := create_directory(empty_bundle)?;
+    empty_readme := path_join(empty_bundle, "README.txt");
+    defer empty_readme.free();
+    _ := write_file(empty_readme, "no theme definitions")?;
+    install_ok(absent_config, empty_bundle);
+    expect(!exists(path_dirname(absent_config)).unwrap_or(false), "non-Lua bundles create no user files or directories");
+
+    {
+        occupied_source := path_join(bundle, "occupied.lua");
+        defer occupied_source.free();
+        _ := write_file(occupied_source, "return 'do not replace a directory'")?;
+        occupied_target := path_join(theme_directory, "occupied.lua");
+        defer occupied_target.free();
+        _ := create_directory(occupied_target)?;
+        sentinel := path_join(occupied_target, "keep.txt");
+        defer sentinel.free();
+        _ := write_file(sentinel, "user directory contents")?;
+        install_ok(config, bundle);
+        expect(is_directory(occupied_target).unwrap_or(false), "existing theme directory entries are preserved");
+        _ := expect_contents(sentinel, "user directory contents", "existing directory contents are never replaced")?;
+    }
+    {
+        linked_source := path_join(bundle, "linked.lua");
+        defer linked_source.free();
+        _ := write_file(linked_source, "return 'do not follow or replace a user link'")?;
+        link := path_join(theme_directory, "linked.lua");
+        defer link.free();
+        missing_target := path_join(root, "do-not-create-linked-theme.lua");
+        defer missing_target.free();
+        if symbolic_link(missing_target, link) == {
+        case .Ok;
+            install_ok(config, bundle);
+            expect(is_symlink(link).unwrap_or(false), "an existing external theme symbolic link is preserved");
+            expect(!exists(missing_target).unwrap_or(false), "a dangling theme link does not create or write its target");
+        case .Err(error);
+            #if OUT.os == .Windows {
+                expect(error.kind == .Permission_Denied || error.kind == .Unsupported,
+                    "theme link coverage is skipped only when symbolic links are unavailable");
+            } else expect(false, "temporary theme symbolic link can be created");
+        }
+    }
+    {
+        blocked_config := path_join(root, "blocked-theme-user", "init.lua");
+        defer blocked_config.free();
+        ensure_ok(blocked_config);
+        obstacle := path_join(path_dirname(blocked_config), "themes");
+        defer obstacle.free();
+        _ := write_file(obstacle, "existing user file")?;
+        error := Config.install_theme_files(blocked_config, bundle);
+        defer error.free();
+        expect(error.count > 0, "a file obstructing the theme directory is diagnosed");
+        _ := expect_contents(obstacle, "existing user file", "theme installation failure preserves the obstructing file")?;
+    }
+    {
+        invalid := path_join(root, "invalid-theme\x00name", "init.lua");
+        defer invalid.free();
+        error := Config.install_theme_files(invalid, bundle);
+        defer error.free();
+        expect(error.count > 0, "a NUL in the theme destination path is diagnosed");
+        prefix := path_join(root, "invalid-theme");
+        defer prefix.free();
+        expect(!exists(prefix).unwrap_or(false), "theme paths containing NUL never write a truncated prefix");
+    }
+    entries := read_directory(theme_directory)?;
+    defer entries.free();
+    for entry: entries.entries
+        expect(!entry.name.starts_with(".init-"), "theme installation leaves no staging files behind");
+    #if OUT.os != .Windows {
+        other_access := File_Permissions.Group_Read | .Group_Write | .Group_Execute |
+            .Other_Read | .Other_Write | .Other_Execute;
+        info := metadata(unicode_target)?;
+        expect((info.permissions & other_access) == .None, "new external theme files have owner-only permissions");
+    }
+    return .Ok(0);
+}
+
+main :: () -> Fs_Error!void {
+    directory := Temporary_Directory.create_temporary_directory("build", "configuration-test-")?;
+    defer directory.free();
+    ensure_ok("");
+
+    // Looking up the real platform directory must not write to it.
+    {
+        selected := Config.default_path();
+        defer selected.free();
+        if get_config_dir() == {
+        case ?config;
+            defer config.free();
+            native := config.to_string();
+            defer native.free();
+            expected := path_join(native, "lush", "init.lua");
+            defer expected.free();
+            expect(selected == expected, "default path uses the standard configuration directory");
+        case null;
+            expect(selected.count == 0, "unavailable configuration directory has no default path");
+        }
+    }
+
+    path := path_join(directory.path, "nested", "lush", "init.lua");
+    defer path.free();
+    parent := path_dirname(path);
+    expect(!exists(path).unwrap_or(false), "configuration starts absent");
+    expect(!exists(parent).unwrap_or(false), "configuration parent starts absent");
+    ensure_ok(path);
+    expect(is_regular_file(path).unwrap_or(false), "default file is created");
+    expect(is_directory(parent).unwrap_or(false), "missing parent directories are created");
+    initial := read_file(path)?;
+    defer initial.free();
+    expect(initial.trim().count > 0, "created configuration contains an editable template");
+    ensure_ok(path);
+    {
+        unchanged := read_file(path)?;
+        defer unchanged.free();
+        expect(unchanged == initial, "repeated ensure preserves the created configuration");
+    }
+
+    // Existing data is user-owned even if it is not valid Lua.
+    malformed :: "-- user configuration 한글\nthis is not Lua !!!\x00keep these bytes\r\n";
+    _ := write_file(path, malformed)?;
+    ensure_ok(path);
+    {
+        unchanged := read_file(path)?;
+        defer unchanged.free();
+        expect(unchanged == malformed, "existing malformed configuration is preserved byte for byte");
+    }
+    _ := write_file(path, "")?;
+    ensure_ok(path);
+    {
+        unchanged := read_file(path)?;
+        defer unchanged.free();
+        expect(unchanged.count == 0, "existing empty configuration is not replaced");
+    }
+
+    {
+        error := Config.ensure_default(parent);
+        defer error.free();
+        expect(error.count > 0, "a directory at the selected file path is diagnosed");
+        expect(is_directory(parent).unwrap_or(false), "directory errors preserve the existing directory");
+    }
+    {
+        obstacle := path_join(directory.path, "parent-file");
+        defer obstacle.free();
+        _ := write_file(obstacle, "existing parent file")?;
+        blocked := path_join(obstacle, "lush", "init.lua");
+        defer blocked.free();
+        error := Config.ensure_default(blocked);
+        defer error.free();
+        expect(error.count > 0, "a file obstructing parent creation is diagnosed");
+        unchanged := read_file(obstacle)?;
+        defer unchanged.free();
+        expect(unchanged == "existing parent file", "parent creation errors preserve existing data");
+    }
+    {
+        invalid := path_join(directory.path, "invalid\x00name", "init.lua");
+        defer invalid.free();
+        error := Config.ensure_default(invalid);
+        defer error.free();
+        expect(error.count > 0, "NUL in a path is diagnosed");
+        prefix := path_join(directory.path, "invalid");
+        defer prefix.free();
+        expect(!exists(prefix).unwrap_or(false), "NUL path never creates a truncated prefix");
+    }
+    {
+        target := path_join(directory.path, "missing-link-target.lua");
+        defer target.free();
+        link := path_join(directory.path, "linked-init.lua");
+        defer link.free();
+        if symbolic_link(target, link) == {
+        case .Ok;
+            ensure_ok(link);
+            expect(is_symlink(link).unwrap_or(false), "an existing symbolic link is preserved");
+            expect(!exists(target).unwrap_or(false), "a dangling configuration link does not create its target");
+        case .Err(error);
+            #if OUT.os == .Windows {
+                expect(error.kind == .Permission_Denied || error.kind == .Unsupported,
+                    "symbolic-link coverage is skipped only when unavailable");
+            } else {
+                expect(false, "temporary symbolic link can be created");
+            }
+        }
+    }
+    #if OUT.os != .Windows {
+        other_access := File_Permissions.Group_Read | .Group_Write | .Group_Execute |
+            .Other_Read | .Other_Write | .Other_Execute;
+        file_info := metadata(path)?;
+        parent_info := metadata(parent)?;
+        expect((file_info.permissions & other_access) == .None,
+            "new configuration file has owner-only permissions");
+        expect((parent_info.permissions & other_access) == .None,
+            "new configuration directory has owner-only permissions");
+    }
+    _ := check_theme_installation(directory.path)?;
+    print("configuration checks passed: {}\n", checks);
+    return .Ok;
+}

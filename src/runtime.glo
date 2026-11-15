@@ -1,0 +1,257 @@
+//! A persistent Lua session with an embedded shell library.
+#import "File_System/File";
+#import "File_System/Path";
+#import "File_System/System";
+#import "Strings/Utf8";
+#import "Io";
+#import "Format";
+#import "Time";
+Lua :: #import "lua.glo";
+Native :: #import "native.glo";
+
+#if OUT.os == .Windows {
+    crt :: #library "c";
+    set_descriptor_mode :: (descriptor: s32, mode: s32) -> s32 #foreign crt "_setmode";
+    Exit_Callback :: #fn_ptr() #c_call;
+    register_exit_callback :: (callback: Exit_Callback) -> s32 #foreign crt "atexit";
+    flush_streams :: (stream: ?*void) -> s32 #foreign crt "fflush";
+    console :: #library "kernel32";
+    get_input_code_page :: () -> u32 #foreign console "GetConsoleCP";
+    get_output_code_page :: () -> u32 #foreign console "GetConsoleOutputCP";
+    set_input_code_page :: (code_page: u32) -> s32 #foreign console "SetConsoleCP";
+    set_output_code_page :: (code_page: u32) -> s32 #foreign console "SetConsoleOutputCP";
+}
+
+saved_console_modes: Console_Modes;
+console_exit_registered: bool;
+console_exit_cleanup :: () #c_call {
+    restore_console(saved_console_modes);
+}
+
+embedded_source :: (name: str) -> str {
+    path := path_join(path_dirname(#source_location.filename), name);
+    if read_file(path) == {
+    case .Ok(source); return source;
+    case .Err(error); print("could not embed Lua shell: {}\n", error.kind); return "";
+    }
+}
+BOOTSTRAP :: #comptime embedded_source("bootstrap.lua");
+RECORDS :: #comptime embedded_source("records.lua");
+COMPLETION :: #comptime embedded_source("completion.lua");
+HIGHLIGHT :: #comptime embedded_source("highlight.lua");
+FILESYSTEM :: #comptime embedded_source("filesystem.lua");
+DATA :: #comptime embedded_source("data.lua");
+SHELL :: #comptime embedded_source("shell.lua");
+HELP :: #comptime embedded_source("help.lua");
+THEME :: #comptime embedded_source("theme.lua");
+
+load_library :: (state: *void, source: str, name: str) -> bool {
+    if Lua.load_buffer(state, source.data, cast(usize) source.count, name.data, "t".data) != 0 ||
+        Lua.call(state, 0, 0, 0, 0, 0) != 0 {
+        diagnostic(Lua.text(state, -1));
+        Lua.set_top(state, 0);
+        return false;
+    }
+    return true;
+}
+
+#public {
+Console_Modes :: struct {
+    input_code_page: u32;
+    output_code_page: u32;
+    input_changed: bool;
+    output_changed: bool;
+}
+prepare_console :: () -> Console_Modes {
+    modes: Console_Modes;
+    #if OUT.os == .Windows {
+        modes.input_code_page = get_input_code_page();
+        modes.output_code_page = get_output_code_page();
+        if modes.input_code_page != 0 && modes.input_code_page != 65001
+            modes.input_changed = set_input_code_page(65001) != 0;
+        if modes.output_code_page != 0 && modes.output_code_page != 65001
+            modes.output_changed = set_output_code_page(65001) != 0;
+        saved_console_modes = modes;
+        // Lua's standard os.exit() bypasses Glosso defers but runs CRT exit hooks.
+        if !console_exit_registered
+            console_exit_registered = register_exit_callback(console_exit_cleanup) == 0;
+    }
+    return modes;
+}
+restore_console :: (modes: Console_Modes) {
+    #if OUT.os == .Windows {
+        // Flush while the UTF-8 page is still active, including output without LF.
+        _ := flush_streams(null);
+        if modes.input_changed _ := set_input_code_page(modes.input_code_page);
+        if modes.output_changed _ := set_output_code_page(modes.output_code_page);
+        saved_console_modes.input_changed = false;
+        saved_console_modes.output_changed = false;
+    }
+}
+Evaluation :: struct {
+    ok: bool;
+    message: str;
+    incomplete: bool;
+}
+Prompt_Line :: struct { left: str; right: str; }
+Prompt :: struct { input: str; lines: [..]Prompt_Line; }
+release_prompt :: (prompt: *Prompt) {
+    prompt.input.free();
+    for line: prompt.lines { line.left.free(); line.right.free(); }
+    prompt.lines.free();
+    prompt.* = .{};
+}
+diagnostic :: (message: str) {
+    error := File.stderr();
+    defer error.free();
+    _ := error.writef("lush: {}\n", message);
+}
+configure_file :: (state: *void, path: str) {
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    if Lua.get_global(state, "lush".data) != 5 return;
+    full: str;
+    if absolute(path) == {
+    case .Ok(value); full = value;
+    case .Err; full = path.clone();
+    }
+    defer full.free();
+    Lua.push_text(state, full);
+    Lua.set_field(state, -2, "config_file".data);
+    Lua.push_text(state, path_dirname(full));
+    Lua.set_field(state, -2, "config_dir".data);
+}
+initialize :: (state: *void) -> bool {
+    // Lua's C streams must preserve raw captured bytes, including CRLF and NUL.
+    // Otherwise writing an already captured CRLF expands it to CRCRLF on Windows.
+    #if OUT.os == .Windows {
+        for descriptor: 0..3 _ := set_descriptor_mode(cast(s32) descriptor, 16#8000);
+    }
+    Lua.open_libraries(state);
+    Native.install(state);
+    return load_library(state, BOOTSTRAP, "@lush/bootstrap.lua") &&
+        load_library(state, RECORDS, "@lush/records.lua") &&
+        load_library(state, FILESYSTEM, "@lush/filesystem.lua") &&
+        load_library(state, DATA, "@lush/data.lua") &&
+        load_library(state, SHELL, "@lush/shell.lua") &&
+        load_library(state, THEME, "@lush/theme.lua") &&
+        load_library(state, HELP, "@lush/help.lua") &&
+        load_library(state, COMPLETION, "@lush/completion.lua") &&
+        load_library(state, HIGHLIGHT, "@lush/highlight.lua");
+}
+invoke_evaluator :: (state: *void, source: str, name: str, display: bool, method: str) -> Evaluation {
+    started := Clock.Monotonic.now().unwrap_or(.{}).nanoseconds;
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    Lua.get_global(state, "lush".data);
+    Lua.get_field(state, -1, method.data);
+    Lua.push_text(state, source);
+    Lua.push_text(state, name);
+    Lua.push_boolean(state, ifx display 1 else 0);
+    result: Evaluation;
+    called := Lua.call(state, 3, 3, 0, 0, 0);
+    if method == "eval" {
+        elapsed := Clock.Monotonic.now().unwrap_or(.{}).nanoseconds - started;
+        if elapsed < 0 elapsed = 0;
+        if Lua.get_global(state, "lush".data) == 5 {
+            Lua.push_integer(state, elapsed / 1_000_000);
+            Lua.set_field(state, -2, "execution_ms".data);
+        }
+        Lua.pop(state);
+    }
+    if called != 0 {
+        result.message = Lua.text(state, -1).clone();
+        return result;
+    }
+    result.ok = Lua.to_boolean(state, -3) != 0;
+    result.incomplete = Lua.to_boolean(state, -1) != 0;
+    if !result.ok result.message = Lua.text(state, -2).clone();
+    return result;
+}
+evaluate :: (state: *void, source: str, name: str, display: bool) -> Evaluation {
+    return invoke_evaluator(state, source, name, display, "eval");
+}
+check :: (state: *void, source: str, name: str) -> Evaluation {
+    return invoke_evaluator(state, source, name, false, "check");
+}
+prompt :: (state: *void) -> Prompt {
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    Lua.get_global(state, "lush".data);
+    Lua.get_field(state, -1, "prompt".data);
+    if Lua.call(state, 0, 1, 0, 0, 0) != 0 {
+        diagnostic(tprint("prompt: {}", Lua.text(state, -1)));
+        return .{ .input = "lush> ".clone() };
+    }
+    if Lua.value_type(state, -1) == 4 {
+        parts := Lua.text(state, -1).split("\n");
+        defer parts.free();
+        result: Prompt;
+        if parts.count == 0 return result;
+        for i: 0..parts.count - 1 {
+            if result.lines.count < 4 result.lines.push(.{ .left = parts[i].clone() });
+        }
+        result.input = parts[parts.count - 1].clone();
+        return result;
+    }
+    if Lua.value_type(state, -1) == 5 {
+        result: Prompt;
+        table := Lua.get_top(state);
+        Lua.push_text(state, "input");
+        input_valid := Lua.raw_get(state, table) == 4;
+        if input_valid result.input = Lua.text(state, -1).clone();
+        Lua.pop(state);
+        Lua.push_text(state, "lines");
+        kind := Lua.raw_get(state, table);
+        valid := input_valid && (kind == 5 || kind == 0);
+        if kind == 5 {
+            lines := Lua.get_top(state);
+            count := cast(ssize) Lua.raw_length(state, lines);
+            if count > 4 count = 4;
+            for i: 1..=count {
+                if Lua.raw_get_integer(state, lines, i) != 5 { valid = false; break; }
+                line := Lua.get_top(state);
+                value: Prompt_Line;
+                Lua.push_text(state, "left");
+                kind = Lua.raw_get(state, line);
+                if kind == 4 value.left = Lua.text(state, -1).clone();
+                else if kind != 0 valid = false;
+                Lua.pop(state);
+                Lua.push_text(state, "right");
+                kind = Lua.raw_get(state, line);
+                if kind == 4 value.right = Lua.text(state, -1).clone();
+                else if kind != 0 valid = false;
+                Lua.pop(state);
+                result.lines.push(value);
+                Lua.pop(state);
+            }
+        }
+        if valid return result;
+        release_prompt(&result);
+    }
+    diagnostic("prompt must return a string or a table with lines and an input string");
+    return .{ .input = "lush> ".clone() };
+}
+last_status :: (state: *void) -> s32 {
+    if Native.requested_exit return Native.requested_code;
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    Lua.get_global(state, "lush".data);
+    Lua.get_field(state, -1, "last_status".data);
+    valid: s32;
+    code := Lua.to_integer(state, -1, &valid);
+    if valid == 0 return 0;
+    if code < 0 || code > 255 return 1;
+    return cast(s32) code;
+}
+set_arguments :: (state: *void, script: str, arguments: []const str) {
+    Lua.create_table(state, cast(s32) arguments.count, 1);
+    Lua.push_text(state, script);
+    Lua.raw_set_integer(state, -2, 0);
+    for argument, index: arguments {
+        Lua.push_text(state, argument);
+        Lua.raw_set_integer(state, -2, index + 1);
+    }
+    Lua.set_global(state, "arg".data);
+}
+}

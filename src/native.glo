@@ -1,0 +1,380 @@
+//! Native filesystem, environment and process services. Lua owns copied return values.
+#import "lua.glo";
+#import "File_System/Directory";
+#import "File_System/File";
+#import "File_System/Metadata";
+#import "File_System/Path";
+#import "File_System/System";
+#import "Io";
+#import "Format";
+#import "Strings/Utf8";
+#import "Process/Environment";
+#import "Terminal";
+Process :: #import "process.glo";
+Executables :: #import "executables.glo";
+Fls :: #import "fls.glo";
+Filesystem :: #import "filesystem.glo";
+Prompt_Context :: #import "prompt_context.glo";
+Theme_VM :: #import "theme_vm.glo";
+Opener :: #import "opener.glo";
+
+theme_source :: (name: str) -> str {
+    filename := path_join(path_dirname(#source_location.filename), name);
+    if read_file(filename) == {
+    case .Ok(contents); return contents;
+    case .Err(error);
+        print("could not embed theme isolation source {}: {}\n", name, error.kind.reason());
+        exit(1);
+    }
+}
+THEME_LIBRARY :: #comptime theme_source("theme.lua");
+THEME_SANDBOX :: #comptime theme_source("theme_sandbox.lua");
+
+native_theme_compile :: (state: *void) -> s32 {
+    return Theme_VM.compile(state, THEME_LIBRARY.data, cast(usize) THEME_LIBRARY.count,
+        THEME_SANDBOX.data, cast(usize) THEME_SANDBOX.count);
+}
+native_theme_read :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "theme path must be a string");
+    if read_file_up_to(text(state, 1), 256 * 1024 + 1) == {
+    case .Err(error); return fs_failure(state, error);
+    case .Ok(contents);
+        defer contents.free();
+        if contents.count > 256 * 1024 return failure(state, "theme source exceeds the 256 KiB limit");
+        push_text(state, contents);
+        return 1;
+    }
+}
+
+failure :: (state: *void, message: str) -> s32 {
+    push_nil(state);
+    push_text(state, message);
+    return 2;
+}
+fs_failure :: (state: *void, error: Fs_Error) -> s32 {
+    return failure(state, tprint("{}: {} (os {})", error.path, error.kind.reason(), error.os_code));
+}
+text_field :: (state: *void, key: str, value: str) {
+    push_text(state, value);
+    set_field(state, -2, key.data);
+}
+integer_field :: (state: *void, key: str, value: s64) {
+    push_integer(state, value);
+    set_field(state, -2, key.data);
+}
+boolean_field :: (state: *void, key: str, value: bool) {
+    push_boolean(state, ifx value 1 else 0);
+    set_field(state, -2, key.data);
+}
+
+native_cwd :: (state: *void) -> s32 {
+    if current_path() == {
+    case .Ok(path);
+        defer path.free();
+        push_text(state, path);
+        return 1;
+    case .Err(error); return fs_failure(state, error);
+    }
+}
+native_cd :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "cd: expected a path string");
+    if set_current_directory(text(state, 1)) == {
+    case .Ok; push_boolean(state, 1); return 1;
+    case .Err(error); return fs_failure(state, error);
+    }
+}
+file_kind :: (kind: File_Kind) -> str {
+    if kind == {
+    case .Regular; return "file";
+    case .Directory; return "dir";
+    case .Symlink; return "symlink";
+    else; return "other";
+    }
+}
+native_list :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "ls: expected a path string");
+    path := text(state, 1);
+    all := to_boolean(state, 2) != 0;
+    if read_directory(path) == {
+    case .Err(error); return fs_failure(state, error);
+    case .Ok(entries);
+        defer entries.free();
+        create_table(state, cast(s32) entries.entries.count, 0);
+        index: s64 = 0;
+        for entry: entries.entries {
+            full := path_join(path, entry.name);
+            defer full.free();
+            if metadata(full, false) == {
+            case .Err(error); pop(state); return fs_failure(state, error);
+            case .Ok(info);
+                if !all && (entry.name.starts_with(".") || info.hidden) continue;
+                create_table(state, 0, 6);
+                text_field(state, "name", entry.name);
+                text_field(state, "path", full);
+                text_field(state, "type", file_kind(info.kind));
+                text_field(state, "kind", file_kind(info.kind));
+                integer_field(state, "size", info.size);
+                boolean_field(state, "is_directory", info.kind == .Directory ||
+                    (info.kind == .Symlink && is_directory(full).unwrap_or(false)));
+                boolean_field(state, "executable", Executables.is_executable(full));
+                if info.modified.valid integer_field(state, "modified", info.modified.seconds);
+                index += 1;
+                raw_set_integer(state, -2, index);
+            }
+        }
+        return 1;
+    }
+}
+native_executables :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "completion: expected a prefix string");
+    matches := Executables.candidates(text(state, 1));
+    defer { for name: matches name.free(); matches.free(); }
+    create_table(state, cast(s32) matches.count, 0);
+    for name, index: matches {
+        push_text(state, name);
+        raw_set_integer(state, -2, index + 1);
+    }
+    return 1;
+}
+native_which :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "which: expected an executable name");
+    path := Executables.resolve(text(state, 1));
+    defer path.free();
+    if path.count == 0 push_nil(state);
+    else push_text(state, path);
+    return 1;
+}
+native_clear :: (state: *void) -> s32 {
+    if Terminal_Session.terminal_begin(.None) == {
+    case .Err; return failure(state, "clear requires an interactive terminal");
+    case .Ok(session);
+        defer session.free();
+        defer session.end();
+        if session.clear().is_err() return failure(state, "could not clear the terminal");
+        push_boolean(state, 1);
+        return 1;
+    }
+}
+read_arguments :: (state: *void, index: s32, arguments: *[..]str) -> bool {
+    if value_type(state, index) != 5 return false;
+    count := cast(ssize) raw_length(state, index);
+    for key: 1..=count {
+        raw_get_integer(state, index, key);
+        if value_type(state, -1) != 4 { pop(state); return false; }
+        argument := text(state, -1);
+        for byte: argument.bytes() {
+            if byte == 0 { pop(state); return false; }
+        }
+        arguments.push(argument);
+        pop(state);
+    }
+    return true;
+}
+native_fls :: (state: *void) -> s32 {
+    arguments: [..]str;
+    defer arguments.free();
+    if !read_arguments(state, 1, &arguments)
+        return failure(state, "ls: expected an array of argument strings without NUL");
+    code := Fls.run(arguments.view());
+    push_integer(state, code);
+    return 1;
+}
+native_fls_records :: (state: *void) -> s32 {
+    arguments: [..]str;
+    defer arguments.free();
+    if !read_arguments(state, 1, &arguments)
+        return failure(state, "ls: expected an array of argument strings without NUL");
+    records := Fls.records(arguments.view());
+    defer Fls.release_records(&records);
+    if records.error.count > 0 return failure(state, records.error);
+    create_table(state, cast(s32) records.items.count, 0);
+    for record, index: records.items {
+        create_table(state, 0, 10);
+        text_field(state, "name", record.name);
+        text_field(state, "path", record.path);
+        text_field(state, "type", record.kind);
+        text_field(state, "kind", record.kind);
+        integer_field(state, "size", record.size);
+        integer_field(state, "depth", record.depth);
+        if record.modified_valid integer_field(state, "modified", record.modified);
+        if record.git_x != 0 {
+            text_field(state, "git", tprint("{c}{c}", record.git_x, record.git_y));
+            integer_field(state, "git_x", record.git_x);
+            integer_field(state, "git_y", record.git_y);
+        }
+        if record.link_target.count > 0 text_field(state, "link_target", record.link_target);
+        raw_set_integer(state, -2, index + 1);
+    }
+    return 1;
+}
+native_env_get :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "env: expected a variable name");
+    if environment_get(text(state, 1)) == {
+    case .Err(error); return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
+    case .Ok(value);
+        if value == {
+        case null; push_nil(state);
+        case ?entry; defer entry.free(); push_text(state, entry.value);
+        }
+        return 1;
+    }
+}
+native_env_set :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "env: expected a variable name");
+    name := text(state, 1);
+    if value_type(state, 2) == 0 {
+        if environment_unset(name) == {
+        case .Err(error); return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
+        case .Ok; push_boolean(state, 1); return 1;
+        }
+    }
+    if value_type(state, 2) != 4 return failure(state, "env: expected a string or nil");
+    if environment_set(name, text(state, 2)) == {
+    case .Err(error); return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
+    case .Ok; push_boolean(state, 1); return 1;
+    }
+}
+native_read :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 return failure(state, "read: expected a path string");
+    if read_file(text(state, 1)) == {
+    case .Err(error); return fs_failure(state, error);
+    case .Ok(contents); defer contents.free(); push_text(state, contents); return 1;
+    }
+}
+native_write :: (state: *void) -> s32 {
+    if value_type(state, 1) != 4 || value_type(state, 2) != 4
+        return failure(state, "write: expected a path and bytes");
+    path := text(state, 1);
+    bytes := text(state, 2);
+    if to_boolean(state, 3) == 0 {
+        if write_file(path, bytes) == {
+        case .Err(error); return fs_failure(state, error);
+        case .Ok; push_boolean(state, 1); return 1;
+        }
+    }
+    if File.open(path, .access = .Write, .disposition = .Open_Or_Create) == {
+    case .Err(error); return fs_failure(state, error);
+    case .Ok(file);
+        defer file.free();
+        if file.seek(0, .End) == {
+        case .Err(error); return fs_failure(state, error);
+        case .Ok;
+        }
+        remaining := bytes;
+        while remaining.count > 0 {
+            if file.write(remaining) == {
+            case .Err(error); return fs_failure(state, error);
+            case .Ok(count);
+                if count == 0 return failure(state, "write: no progress");
+                remaining = remaining[count..];
+            }
+        }
+        push_boolean(state, 1);
+        return 1;
+    }
+}
+native_execute :: (state: *void) -> s32 {
+    if value_type(state, 1) != 5 return failure(state, "execute: expected commands");
+    count := cast(ssize) raw_length(state, 1);
+    if count < 1 return failure(state, "execute: expected at least one command");
+    commands: [..]Process.Invocation;
+    defer commands.free();
+    arrays: [..][..]str;
+    // Structural release frees each argument-array buffer, then the outer array.
+    // Its strings are borrowed from the Lua tables and are not Glosso owners.
+    defer arrays.free();
+    for i: 1..=count {
+        raw_get_integer(state, 1, i);
+        if value_type(state, -1) != 5 return failure(state, "execute: expected argument arrays");
+        size := cast(ssize) raw_length(state, -1);
+        arguments: [..]str;
+        for j: 1..=size {
+            raw_get_integer(state, -1, j);
+            if value_type(state, -1) != 4 {
+                arguments.free();
+                return failure(state, "execute: arguments must be strings");
+            }
+            arguments.push(text(state, -1));
+            pop(state);
+        }
+        pop(state);
+        arrays.push(arguments);
+        commands.push(.{ .args = arguments.view() });
+    }
+    input := text(state, 2);
+    result := Process.execute(commands.view(), input, value_type(state, 2) == 4,
+        to_boolean(state, 3) != 0);
+    defer Process.release(&result);
+    create_table(state, 0, 7);
+    boolean_field(state, "ok", result.code == 0 && result.error.count == 0);
+    integer_field(state, "code", result.code);
+    integer_field(state, "signal", result.signal);
+    text_field(state, "stdout", result.stdout);
+    text_field(state, "stderr", result.stderr);
+    if result.error.count > 0 text_field(state, "error", result.error);
+    create_table(state, cast(s32) result.statuses.count, 0);
+    for status, i: result.statuses { push_integer(state, status); raw_set_integer(state, -2, i + 1); }
+    set_field(state, -2, "statuses".data);
+    return 1;
+}
+native_exit :: (state: *void) -> s32 {
+    valid: s32;
+    code := to_integer(state, 1, &valid);
+    if valid == 0 || code < 0 || code > 255 return failure(state, "exit: expected code 0..255");
+    requested_exit = true;
+    requested_code = cast(s32) code;
+    return 0;
+}
+
+// A C callback has no implicit Glosso context. Re-enter a normal Glosso
+// procedure before calling allocating standard-library operations.
+callback_cwd :: (state: *void) -> s32 #c_call { return native_cwd(state); }
+callback_cd :: (state: *void) -> s32 #c_call { return native_cd(state); }
+callback_list :: (state: *void) -> s32 #c_call { return native_list(state); }
+callback_env_get :: (state: *void) -> s32 #c_call { return native_env_get(state); }
+callback_env_set :: (state: *void) -> s32 #c_call { return native_env_set(state); }
+callback_read :: (state: *void) -> s32 #c_call { return native_read(state); }
+callback_theme_read :: (state: *void) -> s32 #c_call { return native_theme_read(state); }
+callback_theme_compile :: (state: *void) -> s32 #c_call { return native_theme_compile(state); }
+callback_write :: (state: *void) -> s32 #c_call { return native_write(state); }
+callback_execute :: (state: *void) -> s32 #c_call { return native_execute(state); }
+callback_exit :: (state: *void) -> s32 #c_call { return native_exit(state); }
+callback_executables :: (state: *void) -> s32 #c_call { return native_executables(state); }
+callback_which :: (state: *void) -> s32 #c_call { return native_which(state); }
+callback_clear :: (state: *void) -> s32 #c_call { return native_clear(state); }
+callback_fls :: (state: *void) -> s32 #c_call { return native_fls(state); }
+callback_fls_records :: (state: *void) -> s32 #c_call { return native_fls_records(state); }
+bind_native :: (state: *void, name: str, callback: Callback) {
+    push_callback(state, callback, 0);
+    set_field(state, -2, name.data);
+}
+
+#public {
+requested_exit: bool;
+requested_code: s32;
+install :: (state: *void) {
+    create_table(state, 0, 10);
+    bind_native(state, "cwd", callback_cwd);
+    bind_native(state, "cd", callback_cd);
+    bind_native(state, "list", callback_list);
+    bind_native(state, "env_get", callback_env_get);
+    bind_native(state, "env_set", callback_env_set);
+    bind_native(state, "read", callback_read);
+    bind_native(state, "theme_read", callback_theme_read);
+    bind_native(state, "theme_compile", callback_theme_compile);
+    bind_native(state, "write", callback_write);
+    bind_native(state, "execute", callback_execute);
+    bind_native(state, "request_exit", callback_exit);
+    bind_native(state, "executables", callback_executables);
+    bind_native(state, "which", callback_which);
+    bind_native(state, "clear", callback_clear);
+    bind_native(state, "fls", callback_fls);
+    bind_native(state, "fls_records", callback_fls_records);
+    Filesystem.install(state);
+    Opener.install(state);
+    Prompt_Context.install(state);
+    #if OUT.os == .Windows text_field(state, "platform", "windows");
+    else text_field(state, "platform", "unix");
+    set_global(state, "_lush".data);
+}
+}

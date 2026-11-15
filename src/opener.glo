@@ -1,0 +1,135 @@
+//! Open one literal file, directory, or URL with the Windows default handler.
+Lua :: #import "lua.glo";
+#import "Strings/Utf8";
+#import "Strings/Utf16";
+#import "Memory/Ownership";
+#import "Prelude/Freeable";
+#import "Format";
+#import "Meta";
+
+#public {
+// SHELLEXECUTEINFOW, including its pointer-sized anonymous hIcon/hMonitor union.
+Launch_Info :: struct #c_call {
+    cbSize: u32; fMask: u32; hwnd: usize;
+    lpVerb: usize; lpFile: usize; lpParameters: usize; lpDirectory: usize;
+    nShow: s32; hInstApp: usize;
+    lpIDList: usize; lpClass: usize; hkeyClass: usize; dwHotKey: u32;
+    hIcon: usize; hProcess: usize;
+}
+Executor :: #fn_ptr(info: *Launch_Info) -> s32 #c_call;
+Outcome :: struct { ok: bool; error: str; }
+}
+
+#if OUT.os == .Windows {
+    shell :: #library "shell32";
+    ole :: #library "ole32";
+    kernel :: #library "kernel32";
+    shell_execute :: (info: *Launch_Info) -> s32 #foreign shell "ShellExecuteExW";
+    initialize_com :: (reserved: usize, flags: u32) -> s32 #foreign ole "CoInitializeEx";
+    uninitialize_com :: () #foreign ole "CoUninitialize";
+    last_error :: () -> u32 #foreign kernel "GetLastError";
+    format_message :: (flags: u32, source: usize, code: u32, language: u32,
+        buffer: [*]u16, capacity: u32, arguments: usize) -> u32 #foreign kernel "FormatMessageW";
+
+    windows_message :: (code: u32) -> str {
+        wide: [512]u16;
+        count := cast(ssize) format_message(16#1200, 0, code, 0, wide.data, 512, 0);
+        while count > 0 && (wide[count - 1] == 13 || wide[count - 1] == 10 || wide[count - 1] == 32) count -= 1;
+        if count > 0 {
+            units: []const u16 = wide[0..count];
+            if #pattern ?text = units.utf16_from_units()
+                if #pattern ?message = text.to_string() return message;
+        }
+        return "Windows did not provide an error description".clone();
+    }
+    legacy_message :: (code: usize) -> str {
+        if code == 2 return "file not found";
+        if code == 3 return "path not found";
+        if code == 5 return "access denied";
+        if code == 8 return "out of memory";
+        if code == 26 return "the file is in use";
+        if code == 27 return "incomplete file association";
+        if code == 28 return "the application handoff timed out";
+        if code == 29 return "the application handoff failed";
+        if code == 30 return "the application is busy";
+        if code == 31 return "no associated application";
+        if code == 32 return "a required library was not found";
+        return "the default application handoff failed";
+    }
+}
+
+invalid_target :: (target: str) -> str {
+    if target.count == 0 return "open: target must not be empty";
+    if target.has_nul() return "open: target cannot contain NUL";
+    if !target.string_is_valid() return "open: target must contain valid UTF-8";
+    return "";
+}
+
+#public {
+// A native-only dispatch seam permits literal-argument tests without opening
+// applications. Production always supplies ShellExecuteExW; Lua sees no seam.
+// The caller owns Outcome.error and must release it, including an empty result.
+open_with_executor :: (target: str, executor: Executor) -> Outcome {
+    invalid := invalid_target(target);
+    if invalid.count > 0 return .{ .error = invalid.clone() };
+    #if OUT.os == .Windows {
+        filename := target.cstring16_from_string();
+        if cast(usize) filename.data == 0 return .{ .error = "open: could not allocate the UTF-16 target".clone() };
+        defer filename.free();
+        // COM shell extensions may require an STA. A previously initialized
+        // apartment is retained, and only successful initializations are paired.
+        initialized := initialize_com(0, 16#6); // STA | DISABLE_OLE1DDE
+        if initialized < 0 && initialized != -2147417850
+            return .{ .error = tprint("open: COM initialization failed (HRESULT {})", initialized).clone() };
+        defer if initialized >= 0 uninitialize_com();
+        info := Launch_Info.{
+            .cbSize = cast(u32) size_of(Launch_Info),
+            .fMask = 16#500, // NOASYNC | FLAG_NO_UI; no process handle requested.
+            .lpFile = cast(usize) filename.data,
+            .nShow = 1, // SW_SHOWNORMAL
+        };
+        // No parameter string, environment substitution, command interpreter,
+        // or expansion is involved. A null verb selects the association default.
+        if executor(&info) == 0 {
+            code := last_error(); // Capture immediately, before COM cleanup.
+            if code == 0 return .{ .error = tprint("open: {} (shell error {})", legacy_message(info.hInstApp), info.hInstApp).clone() };
+            message := windows_message(code);
+            defer message.free();
+            return .{ .error = tprint("open: {} (Win32 error {})", message, code).clone() };
+        }
+        return .{ .ok = true };
+    } else {
+        return .{ .error = "open: default application launching is supported only on Windows".clone() };
+    }
+}
+open_target :: (target: str) -> Outcome {
+    #if OUT.os == .Windows return open_with_executor(target, cast(Executor) shell_execute);
+    else {
+        invalid := invalid_target(target);
+        return .{ .error = (ifx invalid.count > 0 invalid else "open: default application launching is supported only on Windows").clone() };
+    }
+}
+native_open :: (state: *void) -> s32 {
+    if Lua.value_type(state, 1) != 4 {
+        Lua.push_nil(state);
+        Lua.push_text(state, "open: target must be a string");
+        return 2;
+    }
+    result := open_target(Lua.text(state, 1));
+    defer result.error.free();
+    if !result.ok {
+        Lua.push_nil(state);
+        Lua.push_text(state, result.error);
+        return 2;
+    }
+    Lua.push_boolean(state, 1);
+    return 1;
+}
+install :: (state: *void) {
+    Lua.push_callback(state, callback_open, 0);
+    Lua.set_field(state, -2, "open".data);
+}
+}
+
+// Keep allocator/context setup in the normal Glosso procedure, as other natives.
+callback_open :: (state: *void) -> s32 #c_call { return native_open(state); }

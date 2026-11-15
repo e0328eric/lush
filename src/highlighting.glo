@@ -1,0 +1,38 @@
+//! Validated lexical colors for editable Lua. Lua returns data, never terminal escapes.
+Lua :: #import "lua.glo";
+#import "Strings/Utf8";
+
+#public {
+
+// Owned mask, one ASCII category per original UTF-8 byte. Failure is plain text.
+mask :: (state: *void, source: str) -> str {
+    empty: str;
+    if source.count == 0 return empty;
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    if Lua.get_global(state, "lush".data) != 5 return empty;
+    table := Lua.get_top(state);
+    Lua.push_text(state, "highlight");
+    if Lua.raw_get(state, table) != 6 return empty;
+    Lua.push_text(state, source);
+    if Lua.call(state, 1, 1, 0, 0, 0) != 0 || Lua.value_type(state, -1) != 4 return empty;
+    result := Lua.text(state, -1);
+    if result.count != source.count return empty;
+    for i: 0..result.count if result[i] < 48 || result[i] > 55 return empty;
+    return result.clone();
+}
+
+color :: (category: u8) -> str {
+    if category == {
+    case 49; return "\x1b[95m"; // Keywords and literals.
+    case 50; return "\x1b[32m"; // Strings.
+    case 51; return "\x1b[33m"; // Numbers.
+    case 52; return "\x1b[90m"; // Comments, without dim (reserved for suggestions).
+    case 53; return "\x1b[36m"; // Calls and builtins.
+    case 54; return "\x1b[94m"; // Operators and punctuation.
+    case 55; return "\x1b[91m"; // Lexical errors.
+    else; return "\x1b[39m";
+    }
+}
+
+}

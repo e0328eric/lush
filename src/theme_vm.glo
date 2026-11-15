@@ -1,0 +1,47 @@
+//! Build the narrow C boundary for quota-limited, isolated theme Lua states.
+#import "Compiler";
+#import "File_System/Path";
+#import "File_System/Metadata";
+#import "Strings/Utf8";
+#import "Format";
+#import "Io";
+
+bindings_source :: #comptime -> str {
+    headers: str;
+    for name: .["thirdparty/lua", "lib/lua", "lua"] {
+        candidate := find_resource(name);
+        if candidate.count > 0 && exists(path_join(candidate, "src", "lua.h")).unwrap_or(false) {
+            headers = path_join(candidate, "src");
+            break;
+        }
+    }
+    if headers.count == 0 return "#comptime { #compile_error \"could not locate bundled Lua headers for theme isolation\"; }";
+    source := path_join(path_dirname(#source_location.filename), "theme_vm.c");
+    sources := .[source];
+    includes := .[headers];
+    definitions: [..]str;
+    defer definitions.free();
+    #if OUT.os != .Windows definitions.push("_POSIX_C_SOURCE=200809L");
+    result := Native_Compile_Output.compile_c_archive("lush_theme_vm", sources[..],
+        .include_paths = includes[..], .preprocessor_definitions = definitions.view(),
+        .compiler_args = .["-std=c11", "-Wall", "-Wextra", "-Werror"][..],
+        .optimization_level = .O2, .position_independent = OUT.os != .Windows);
+    if result == {
+    case .Err(error);
+        print("theme isolation C build failed:\n{}\n", error.message);
+        return "#comptime { #compile_error \"could not build theme isolation boundary\"; }";
+    case .Ok(built);
+        defer built.artifact.free(); defer built.output.free();
+        archive := built.artifact.replace("\\", "/");
+        defer archive.free();
+        return tprint("theme_vm_library :: #library,static \"{}\";", archive);
+    }
+    return "";
+}
+#insert bindings_source;
+
+#public {
+compile :: (state: *void, theme_source: [*]const u8, theme_length: usize,
+    runner_source: [*]const u8, runner_length: usize) -> s32
+    #foreign theme_vm_library "lush_theme_compile";
+}

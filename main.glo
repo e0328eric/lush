@@ -1,0 +1,178 @@
+//! Lush: a structured shell whose only scripting language is Lua.
+#import "Io";
+#import "Format";
+#import "Strings/Utf8";
+#import "File_System/File";
+#import "File_System/Metadata";
+#import "File_System/Path";
+#import "File_System/System";
+#import "Process/Environment";
+Lua :: #import "src/lua.glo";
+Runtime :: #import "src/runtime.glo";
+Native :: #import "src/native.glo";
+Repl :: #import "src/repl.glo";
+History :: #import "src/history.glo";
+Configuration :: #import "src/configuration.glo";
+
+usage :: () {
+    print("{}", #string
+        \\A structured shell using pure Lua 5.5, implemented in Glosso.
+        \\
+        \\Usage:
+        \\  lush {flags} [SCRIPT.lua [ARGS...]]
+        \\
+        \\Flags:
+        \\  -c, --command <string>  Evaluate Lua and display expression results.
+        \\  --config <path>        Load a Lua configuration before running.
+        \\  --no-config            Skip configuration loading and creation.
+        \\  -h, --help             Display this help message.
+        \\  -v, --version          Display the version.
+        \\  --                     End flag parsing.
+        \\
+        \\Parameters:
+        \\  SCRIPT.lua (optional)  Lua script to run; otherwise open the prompt or read stdin.
+        \\  ARGS... (optional)     Arguments made available as arg[1], arg[2], ...
+        \\
+        \\Input/output types:
+        \\  input: Lua source on stdin, or an interactive terminal
+        \\  output: displayed Lua values, structured tables, or external program output
+        \\
+        \\Examples:
+        \\  lush
+        \\  lush -c 'ls():select("name", "size")'
+        \\  lush -c 'cmd.git("status")'
+        \\  lush tasks.lua argument
+        \\  lush -c 'help("commands")'
+        \\  lush -c 'help("ls")'
+        \\
+    );
+}
+
+run_file :: (state: *void, path: str) -> bool {
+    if read_file(path) == {
+    case .Err(error);
+        Runtime.diagnostic(tprint("{}: {}", path, error.kind.reason()));
+        return false;
+    case .Ok(source);
+        defer source.free();
+        contents := source;
+        if contents.count >= 3 && contents.bytes()[0] == 16#ef &&
+            contents.bytes()[1] == 16#bb && contents.bytes()[2] == 16#bf
+            contents = contents[3..];
+        // Match Lua's script loader: permit a UTF-8 BOM and an interpreter line.
+        // Retain the newline so diagnostics still refer to original line numbers.
+        if contents.starts_with("#!") {
+            at: ssize = 0;
+            while at < contents.count && contents.bytes()[at] != 10 at += 1;
+            contents = contents[at..];
+        }
+        evaluation := Runtime.evaluate(state, contents, tprint("@{}", path), false);
+        defer evaluation.message.free();
+        if !evaluation.ok Runtime.diagnostic(evaluation.message);
+        return evaluation.ok;
+    }
+}
+
+main :: () -> s32 {
+    arguments := get_cmdline_args();
+    startup_directory := current_path().unwrap_or("".clone());
+    defer startup_directory.free();
+    no_config := false;
+    explicit_config := false;
+    config: str;
+    code: str;
+    script: str;
+    command_mode := false;
+    remaining: []const str;
+    index: ssize = 1;
+    while index < arguments.count {
+        argument := arguments[index];
+        if argument == "--help" || argument == "-h" { usage(); return 0; }
+        if argument == "--version" || argument == "-v" { print("lush 0.1.0 (Lua 5.5, Glosso)\n"); return 0; }
+        if argument == "--no-config" { no_config = true; index += 1; continue; }
+        if argument == "--config" {
+            index += 1;
+            if index >= arguments.count { Runtime.diagnostic("--config requires a path"); return 2; }
+            config = arguments[index];
+            explicit_config = true;
+            index += 1;
+            continue;
+        }
+        if argument == "-c" || argument == "--command" {
+            index += 1;
+            if index >= arguments.count { Runtime.diagnostic("-c requires Lua code"); return 2; }
+            code = arguments[index];
+            command_mode = true;
+            index += 1;
+            if index < arguments.count && arguments[index] == "--" index += 1;
+            remaining = arguments[index..];
+            break;
+        }
+        if argument == "--" {
+            index += 1;
+            if index >= arguments.count break;
+            script = arguments[index];
+            remaining = arguments[index + 1..];
+            break;
+        }
+        if argument.starts_with("-") {
+            Runtime.diagnostic(tprint("unknown option '{}'; see --help", argument));
+            return 2;
+        }
+        script = argument;
+        remaining = arguments[index + 1..];
+        break;
+    }
+    if no_config && explicit_config {
+        Runtime.diagnostic("--config and --no-config cannot be combined");
+        return 2;
+    }
+    // A Lua config may change environment variables or the working directory.
+    // Keep default files anchored to the platform directory selected at startup.
+    default_history := History.default_path();
+    defer default_history.free();
+    console_modes := Runtime.prepare_console();
+    defer Runtime.restore_console(console_modes);
+    if Lua.new_state() == {
+    case null; Runtime.diagnostic("could not create Lua state"); return 1;
+    case ?state;
+        defer Lua.close(state);
+        if !Runtime.initialize(state) return 1;
+        Runtime.set_arguments(state, ifx command_mode "-c" else script, remaining);
+        if !no_config {
+            selected: str;
+            defer selected.free();
+            override := environment_get_or("LUSH_CONFIG", "").unwrap_or("".clone());
+            defer override.free();
+            required := explicit_config || override.count > 0;
+            if explicit_config selected = config.clone();
+            else if override.count > 0 selected = override.clone();
+            else {
+                selected = Configuration.default_path();
+                installed := Configuration.install_theme_files(selected);
+                defer installed.free();
+                if installed.count > 0 Runtime.diagnostic(installed);
+                error := Configuration.ensure_default(selected);
+                defer error.free();
+                if error.count > 0 Runtime.diagnostic(error);
+            }
+            if selected.count > 0 {
+                Runtime.configure_file(state, selected);
+                available := is_regular_file(selected).unwrap_or(false);
+                if (required || available) && !run_file(state, selected) return 1;
+            }
+        }
+        if Native.requested_exit return Native.requested_code;
+        if command_mode {
+            result := Runtime.evaluate(state, code, "=(command)", true);
+            defer result.message.free();
+            if !result.ok { Runtime.diagnostic(result.message); return 1; }
+            return Runtime.last_status(state);
+        }
+        if script.count > 0 {
+            if !run_file(state, script) return 1;
+            return Runtime.last_status(state);
+        }
+        return Repl.run(state, startup_directory, default_history);
+    }
+}

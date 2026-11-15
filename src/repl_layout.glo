@@ -1,0 +1,171 @@
+//! The active prompt's logical rows survive host main-buffer reflow.
+#import "Terminal";
+#import "Strings/Utf8";
+#import "String_Builder";
+#import "Format";
+#import "Io";
+#import "Memory/Ownership";
+#import "Prelude/Freeable";
+
+#if OUT.os == .Windows {
+    console :: #library "kernel32";
+    get_std_handle :: (identifier: u32) -> ssize #foreign console "GetStdHandle";
+    Buffer_Info :: struct #c_call {
+        width: s16; height: s16; cursor_x: s16; cursor_y: s16; attributes: u16;
+        left: s16; top: s16; right: s16; bottom: s16; max_x: s16; max_y: s16;
+    }
+    get_info :: (handle: ssize, info: *Buffer_Info) -> s32 #foreign console "GetConsoleScreenBufferInfo";
+    fill_characters :: (handle: ssize, value: u16, count: u32, coordinate: u32, written: *u32) -> s32
+        #foreign console "FillConsoleOutputCharacterW";
+    fill_attributes :: (handle: ssize, value: u16, count: u32, coordinate: u32, written: *u32) -> s32
+        #foreign console "FillConsoleOutputAttribute";
+    native_handle :: (session: *Terminal_Session) -> ssize {
+        handle := cast(ssize) session.output.handle;
+        // Glosso reserves 0/1/2 for standard streams; they are not Win32 HANDLEs.
+        if handle >= 0 && handle <= 2 return get_std_handle(cast(u32) (-10 - handle));
+        return handle;
+    }
+}
+
+#public {
+Geometry :: struct {
+    columns: ssize; rows: ssize; buffer_columns: ssize; buffer_rows: ssize;
+    viewport_y: ssize; cursor_y: ssize; cursor_x: ssize; attributes: u16;
+    native_cursor: bool;
+}
+Row :: struct { widths: [..]u8; }
+Footprint :: struct {
+    valid: bool;
+    columns: ssize; rows: ssize; buffer_columns: ssize;
+    headers: ssize;
+    header: [4]Row;
+    input: Row;
+    caret_cells: ssize;
+}
+release :: (footprint: *Footprint) {
+    for i: 0..4 footprint.header[i].widths.free();
+    footprint.input.widths.free();
+}
+query :: (session: *Terminal_Session) -> Geometry {
+    result: Geometry;
+    #if OUT.os == .Windows {
+        info: Buffer_Info;
+        if get_info(native_handle(session), &info) != 0 {
+            result.columns = cast(ssize) info.right - cast(ssize) info.left + 1;
+            result.rows = cast(ssize) info.bottom - cast(ssize) info.top + 1;
+            result.buffer_columns = cast(ssize) info.width;
+            result.buffer_rows = cast(ssize) info.height;
+            result.viewport_y = cast(ssize) info.top;
+            result.cursor_y = cast(ssize) info.cursor_y;
+            result.cursor_x = cast(ssize) info.cursor_x;
+            result.attributes = info.attributes;
+            result.native_cursor = true;
+            session.capabilities.columns = result.columns;
+            session.capabilities.rows = result.rows;
+            session.capabilities.viewport_x = cast(ssize) info.left;
+            session.capabilities.viewport_y = result.viewport_y;
+            return result;
+        }
+    }
+    session.size();
+    result.columns = session.capabilities.columns;
+    result.rows = session.capabilities.rows;
+    if result.columns <= 0 result.columns = 80;
+    if result.rows <= 0 result.rows = 24;
+    result.buffer_columns = result.columns;
+    result.buffer_rows = result.rows;
+    return result;
+}
+changed :: (footprint: *Footprint, geometry: Geometry, headers: ssize) -> bool {
+    return !footprint.valid || footprint.columns != geometry.columns || footprint.rows != geometry.rows ||
+        footprint.buffer_columns != geometry.buffer_columns || footprint.headers != headers;
+}
+reset_row :: (row: *Row) { row.widths.clear(); }
+append_width :: (row: *Row, width: ssize) {
+    if width > 0 row.widths.push(cast(u8) width);
+}
+append_spaces :: (row: *Row, count: ssize) {
+    for i: 0..count row.widths.push(1);
+}
+append_text :: (row: *Row, text: str) {
+    escape: bool;
+    for value: text {
+        scalar := cast(u32) value;
+        if scalar == 27 { escape = true; continue; }
+        if escape {
+            // Only SGR survives prompt_fragment, so its first '[' is not final.
+            if scalar != 91 && scalar >= 64 && scalar <= 126 escape = false;
+            continue;
+        }
+        append_width(row, terminal_rune_width(scalar));
+    }
+}
+Packing :: struct { rows: ssize; caret_row: ssize; }
+pack :: (row: *Row, columns: ssize, caret_cells: ssize = -1) -> Packing {
+    result := Packing.{ .rows = 1 };
+    column: ssize; original: ssize; found: bool;
+    for raw_width: row.widths {
+        width := cast(ssize) raw_width;
+        if width > columns width = columns;
+        if column + width > columns { result.rows += 1; column = 0; }
+        if !found && original == caret_cells { result.caret_row = result.rows - 1; found = true; }
+        column += width;
+        original += cast(ssize) raw_width;
+    }
+    if caret_cells >= 0 && !found {
+        result.caret_row = result.rows - 1;
+        if column == columns result.caret_row += 1;
+        if result.caret_row >= result.rows result.rows = result.caret_row + 1;
+    }
+    return result;
+}
+
+// Return to the start of the OLD owned band. A resize may have wrapped a
+// header or the text AFTER the caret, so clearing one line cannot repair it.
+recover :: (session: *Terminal_Session, footprint: *Footprint, geometry: Geometry, frame: *String_Builder) {
+    columns := geometry.buffer_columns;
+    if columns <= 0 columns = geometry.columns;
+    if columns <= 0 columns = 1;
+    header_rows: ssize;
+    for i: 0..footprint.headers header_rows += pack(&footprint.header[i], columns).rows;
+    input := pack(&footprint.input, columns, footprint.caret_cells);
+    rewind := header_rows + input.caret_row;
+    if geometry.native_cursor {
+        top := geometry.cursor_y - rewind;
+        bottom := geometry.cursor_y - input.caret_row + input.rows - 1;
+        // In a native console with scrollback, only this owned band's hidden
+        // rows may be cleared. Visible clearing remains in the atomic VT frame.
+        #if OUT.os == .Windows {
+            hidden_top := top;
+            if hidden_top < 0 hidden_top = 0;
+            hidden_bottom := bottom;
+            if hidden_bottom >= geometry.viewport_y hidden_bottom = geometry.viewport_y - 1;
+            if hidden_bottom >= hidden_top {
+                count := cast(u32) ((hidden_bottom - hidden_top + 1) * geometry.buffer_columns);
+                coordinate := cast(u32) (cast(u16) hidden_top) << 16;
+                written: u32;
+                fill_characters(native_handle(session), 32, count, coordinate, &written);
+                fill_attributes(native_handle(session), geometry.attributes, count, coordinate, &written);
+            }
+        }
+        top -= geometry.viewport_y;
+        bottom -= geometry.viewport_y;
+        if top < 0 top = 0;
+        if top >= geometry.rows top = geometry.rows - 1;
+        if bottom >= geometry.rows bottom = geometry.rows - 1;
+        if bottom < top bottom = top;
+        for row: top..=bottom frame.writef("\x1b[{};1H\x1b[2K", row + 1);
+        frame.writef("\x1b[{};1H", top + 1);
+    } else {
+        if rewind > 0 frame.writef("\x1b[{}A", rewind);
+        total := header_rows + input.rows;
+        if total > geometry.rows total = geometry.rows;
+        for row: 0..total {
+            frame.write_string("\r\x1b[2K");
+            if row + 1 < total frame.write_string("\x1b[1B");
+        }
+        if total > 1 frame.writef("\x1b[{}A", total - 1);
+        frame.write_string("\r");
+    }
+}
+}

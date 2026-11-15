@@ -1,0 +1,37 @@
+//! Keep the text cursor hidden while painting, as in rne's terminal loop.
+#import "Terminal";
+#import "Io";
+#import "Format";
+
+#public {
+
+// Mirror visibility in the VT stream as well as the native console API.
+// ConPTY hosts maintain their own cursor state; a native-only hide can leave
+// their visible cursor following the canvas's row-positioning sequences.
+hide_cursor :: (session: *Terminal_Session) -> Io_Error!ssize {
+    _ := session.cursor_show(false)?;
+    return session.write("\x1b[?25l");
+}
+
+restore_cursor :: (session: *Terminal_Session) -> Io_Error!ssize {
+    _ := session.cursor_show(true)?;
+    return session.write("\x1b[?25h");
+}
+
+render :: (
+    canvas: *Terminal_Canvas, session: *Terminal_Session,
+    caret: Terminal_Point = .{ -1, -1 }
+) -> Io_Error!ssize {
+    _ := hide_cursor(session)?;
+    count := canvas.render_at(session, 0, 0)?;
+    if caret.x >= 0 && caret.y >= 0 {
+        _ := session.cursor_to(cast(s64) caret.x, cast(s64) caret.y)?;
+        // Position before showing, including in the host's VT cursor state.
+        _ := session.write(tprint("\x1b[{};{}H", caret.y + 1, caret.x + 1))?;
+        _ := restore_cursor(session)?;
+    }
+    _ := session.flush()?;
+    return .Ok(count);
+}
+
+}

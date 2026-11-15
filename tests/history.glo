@@ -1,0 +1,184 @@
+H :: #import "../src/history.glo";
+#import "File_System/Directory";
+#import "File_System/Path";
+#import "File_System/File";
+#import "File_System/Metadata";
+#import "File_System/Temporary";
+#import "Serialization/Json";
+#import "String_Builder";
+#import "Strings/Utf8";
+#import "Time";
+#import "Io";
+#import "Process";
+
+checks: s64;
+expect :: (condition: bool, message: str) {
+    checks += 1;
+    if !condition {
+        print("history check failed: {}\n", message);
+        exit(1);
+    }
+}
+
+append_ok :: (path: str, command: str) {
+    error := H.append(path, command);
+    defer error.free();
+    if error.count > 0 print("append error: {}\n", error);
+    expect(error.count == 0, "append succeeds");
+}
+
+main :: () -> Fs_Error!void {
+    directory := Temporary_Directory.create_temporary_directory("build", "history-test-")?;
+    defer directory.free();
+    path := path_join(directory.path, "private", "history.jsonl");
+    defer path.free();
+    {
+        selected := H.default_path();
+        defer selected.free();
+        if get_config_dir() == {
+        case ?config;
+            defer config.free();
+            native := config.to_string();
+            defer native.free();
+            expected := path_join(native, "lush", "history.jsonl");
+            defer expected.free();
+            expect(selected == expected, "default history uses standard configuration directory");
+        case null; expect(selected.count == 0, "unavailable configuration directory disables default path");
+        }
+        loaded := H.load(path);
+        defer H.release_load(&loaded);
+        expect(loaded.commands.count == 0 && loaded.error.count == 0, "missing history is quiet");
+        expect(!exists(path).unwrap_or(false), "loading never creates a history file");
+        parent := path_join(directory.path, "private");
+        defer parent.free();
+        expect(!exists(parent).unwrap_or(false), "loading never creates a history directory");
+        append_ok(path, "  \t\n");
+        expect(!exists(path).unwrap_or(false), "blank commands do not create a file");
+    }
+    first :: "print('한글')";
+    second :: "function greeting()\n  print('hello \\\"world\\\"')\nend";
+    append_ok(path, first);
+    append_ok(path, second);
+    append_ok(path, "third");
+    {
+        loaded := H.load(path);
+        defer H.release_load(&loaded);
+        expect(loaded.error.count == 0 && loaded.commands.count == 3, "three commands load");
+        expect(loaded.commands[0] == first, "Unicode is preserved");
+        expect(loaded.commands[1] == second, "multiline quotes and backslashes are preserved");
+        expect(loaded.commands[2] == "third", "append order is preserved");
+        latest := H.load(path, 2);
+        defer H.release_load(&latest);
+        expect(latest.commands.count == 2 && latest.commands[0] == second && latest.commands[1] == "third",
+            "count limit retains the newest commands in order");
+        disabled := H.load(path, 0);
+        defer H.release_load(&disabled);
+        expect(disabled.commands.count == 0 && disabled.error.count == 0, "zero limit disables loading");
+        bytes := read_file(path)?;
+        defer bytes.free();
+        parts := bytes.split("\n");
+        defer parts.free();
+        expect(parts.count == 4, "one complete JSON string per physical line");
+        decoded: str;
+        if json_deserialize(str, parts[1]) == {
+        case .Ok(value); decoded = value;
+        case .Err; expect(false, "JSON line decodes");
+        }
+        defer decoded.free();
+        expect(decoded == second, "records are standard JSON strings");
+    }
+    {
+        malformed :: "\"kept\"\nnot json\n42\n{\"not\":\"a command\"}\n\"also kept\"\r\n\"unfinished";
+        _ := write_file(path, malformed)?;
+        loaded := H.load(path);
+        defer H.release_load(&loaded);
+        expect(loaded.error.count == 0 && loaded.commands.count == 2, "malformed and unfinished lines are skipped");
+        expect(loaded.commands[0] == "kept" && loaded.commands[1] == "also kept", "valid lines survive malformed neighbors");
+        append_ok(path, "recovered");
+        bytes := read_file(path)?;
+        defer bytes.free();
+        expect(bytes.starts_with(malformed), "append never overwrites an existing file's contents");
+        recovered := H.load(path);
+        defer H.release_load(&recovered);
+        expect(recovered.commands.count == 3 && recovered.commands[2] == "recovered",
+            "append separates a corrupt final fragment from the next command");
+    }
+    {
+        content: String_Builder;
+        defer content.free();
+        for i: 0..1005 {
+            content.write_string("\"command-");
+            content.write_int(i);
+            content.write_string("\"\n");
+        }
+        _ := write_file(path, content.to_string())?;
+        loaded := H.load(path, 3);
+        defer H.release_load(&loaded);
+        expect(loaded.commands.count == 3, "ring never exceeds its count bound");
+        expect(loaded.commands[0] == "command-1002" && loaded.commands[2] == "command-1004",
+            "ring wraps while preserving newest command order");
+    }
+    {
+        content: String_Builder;
+        defer content.free();
+        content.write_repeated_byte(120, H.MAX_HISTORY_BYTES + 16384);
+        content.write_string("\n\"newest after huge fragment\"\n");
+        _ := write_file(path, content.to_string())?;
+        loaded := H.load(path);
+        defer H.release_load(&loaded);
+        expect(loaded.error.count == 0 && loaded.commands.count == 1 &&
+            loaded.commands[0] == "newest after huge fragment", "large files load their newest tail and skip its initial fragment");
+    }
+    {
+        content: String_Builder;
+        defer content.free();
+        content.write_repeated_byte(120, H.MAX_RECORD_BYTES + 1);
+        content.write_string("\n\"after oversized\"\n\"unterminated but valid JSON\"");
+        _ := write_file(path, content.to_string())?;
+        loaded := H.load(path);
+        defer H.release_load(&loaded);
+        expect(loaded.commands.count == 1 && loaded.commands[0] == "after oversized",
+            "oversized and non-LF-terminated records are ignored");
+    }
+    {
+        invalid := H.load(directory.path);
+        defer H.release_load(&invalid);
+        expect(invalid.error.count > 0 && invalid.commands.count == 0, "directory load is a nonfatal error");
+        error := H.append(directory.path, "example");
+        defer error.free();
+        expect(error.count > 0, "append rejects directories");
+        nul := H.load("invalid\0path");
+        defer H.release_load(&nul);
+        expect(nul.error.count > 0, "embedded NUL in paths is rejected");
+        invalid_append := H.append("invalid\0path", "example");
+        defer invalid_append.free();
+        expect(invalid_append.count > 0, "append rejects NUL paths");
+    }
+    {
+        held := File.open(path, .access = .Read_Write)?;
+        defer held.free();
+        _ := held.lock(.Exclusive, .nonblocking = true)?;
+        before := Clock.Monotonic.now().unwrap_or(.{}).nanoseconds;
+        busy := H.append(path, "must not be written");
+        defer busy.free();
+        elapsed := Clock.Monotonic.now().unwrap_or(.{}).nanoseconds - before;
+        expect(busy.count > 0 && elapsed < 2_000_000_000, "busy append is bounded and nonfatal");
+        loaded := H.load(path);
+        defer H.release_load(&loaded);
+        expect(loaded.error.count > 0, "busy reader does not consume a partial writer record");
+        _ := held.unlock()?;
+        append_ok(path, "after unlock");
+        final := H.load(path);
+        defer H.release_load(&final);
+        expect(final.commands[final.commands.count - 1] == "after unlock", "history works after lock contention");
+        for command: final.commands expect(command != "must not be written", "busy append preserves file contents");
+    }
+    #if OUT.os != .Windows {
+        info := metadata(path)?;
+        other_access := File_Permissions.Group_Read | .Group_Write | .Group_Execute |
+            .Other_Read | .Other_Write | .Other_Execute;
+        expect((info.permissions & other_access) == .None, "new history files have owner-only permissions");
+    }
+    print("history checks passed: {}\n", checks);
+    return .Ok;
+}

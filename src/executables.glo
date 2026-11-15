@@ -1,0 +1,232 @@
+//! Executable completion follows the process backend's PATH lookup rules.
+//! Results own their strings and array; the caller releases both.
+#import "File_System/Directory";
+#import "File_System/Metadata";
+#import "File_System/Path";
+#import "File_System/System";
+#import "Process/Environment";
+#import "Strings/Utf8";
+#import "String_Builder";
+#import "Sort";
+#import "Os";
+#import "Format";
+
+same_name :: (left: str, right: str) -> bool {
+    #if OUT.os == .Windows return environment_names_equal(left, right);
+    else return left == right;
+}
+
+name_order :: (left: str, right: str) -> Ordering {
+    #if OUT.os == .Windows {
+        if environment_name_before(left, right) return .Less;
+        if environment_name_before(right, left) return .Greater;
+    }
+    // Keep spelling deterministic even when Windows treats names as equal.
+    return left <=> right;
+}
+
+has_prefix :: (name: str, prefix: str) -> bool {
+    if prefix.count > name.count return false;
+    return same_name(name[0..prefix.count], prefix);
+}
+
+trim_space :: (value: str) -> str {
+    first: ssize = 0;
+    last := value.count;
+    while first < last && (value[first] == 32 || value[first] == 9) first += 1;
+    while last > first && (value[last - 1] == 32 || value[last - 1] == 9) last -= 1;
+    return value[first..last];
+}
+
+// PATHEXT entries outside these four would require file associations or a
+// separate interpreter. The process backend deliberately does neither.
+windows_extension :: (name: str, extensions: str) -> str {
+    dot := name.count;
+    while dot > 0 && name[dot - 1] != 46 dot -= 1;
+    if dot == 0 return "";
+    suffix := name[dot - 1..];
+    if !same_name(suffix, ".exe") && !same_name(suffix, ".com") &&
+        !same_name(suffix, ".bat") && !same_name(suffix, ".cmd") return "";
+    start: ssize = 0;
+    while start <= extensions.count {
+        end := start;
+        while end < extensions.count && extensions[end] != 59 end += 1;
+        if same_name(suffix, trim_space(extensions[start..end])) return suffix;
+        start = end + 1;
+    }
+    return "";
+}
+
+completion_name :: (name: str, extensions: str) -> str {
+    #if OUT.os == .Windows {
+        suffix := windows_extension(name, extensions);
+        if suffix.count == 0 return "";
+        if same_name(suffix, ".exe") {
+            stem := name[0..name.count - 4];
+            // Bare dotted names do not receive .exe from Process/Command.
+            dotted := false;
+            for byte: stem.bytes() if byte == 46 dotted = true;
+            if !dotted return stem;
+        }
+    }
+    return name;
+}
+
+executable_path :: (path: str, extensions: str) -> bool {
+    #if OUT.os == .Windows {
+        if windows_extension(path_basename(path), extensions).count == 0 return false;
+        // App execution aliases may be reparse points. Like the spawn
+        // resolver, accept an existing nondirectory rather than requiring
+        // metadata to follow a possibly special alias.
+        return exists(path).unwrap_or(false) && !is_directory(path).unwrap_or(false);
+    } else {
+        if metadata(path, true) == {
+        case .Err; return false;
+        case .Ok(info);
+            if info.kind != .Regular return false;
+        }
+        return access(path, .Executable).is_ok();
+    }
+}
+
+append_directory :: (names: *[..]str, directory: str, prefix: str, extensions: str) {
+    if read_directory(directory) == {
+    case .Err; return;
+    case .Ok(entries);
+        defer entries.free();
+        for entry: entries.entries {
+            name := completion_name(entry.name, extensions);
+            if name.count == 0 || !has_prefix(name, prefix) continue;
+            full := path_join(directory, entry.name);
+            defer full.free();
+            if !executable_path(full, extensions) continue;
+            names.push(name.clone());
+        }
+    }
+}
+
+resolve_in_directory :: (directory: str, name: str, extensions: str) -> str {
+    candidate := path_join(directory, name);
+    defer candidate.free();
+    if executable_path(candidate, extensions) return absolute(candidate).unwrap_or("".clone());
+    #if OUT.os == .Windows {
+        // Bare names can resolve supported PATHEXT formats. A supplied extension
+        // is exact, matching explicit cmd[which(name)] execution.
+        has_extension := false;
+        for byte: path_basename(name).bytes() if byte == 46 has_extension = true;
+        if !has_extension {
+            start: ssize = 0;
+            while start < extensions.count {
+                end := start;
+                while end < extensions.count && extensions[end] != 59 end += 1;
+                extension := trim_space(extensions[start..end]);
+                full := tprint("{}{}", candidate, extension);
+                if executable_path(full, extensions) return absolute(full).unwrap_or("".clone());
+                start = end + 1;
+            }
+        }
+    }
+    empty: str;
+    return empty;
+}
+
+#public {
+
+// First executable in PATH (or an explicit path), returned as an owned absolute path.
+resolve :: (name: str) -> str {
+    empty: str;
+    if name.count == 0 || name.has_nul() return empty;
+    extensions := environment_get_or("PATHEXT", ".COM;.EXE;.BAT;.CMD").unwrap_or("");
+    defer extensions.free();
+    explicit := false;
+    for byte: name.bytes() if byte == 47 || (OUT.os == .Windows && (byte == 92 || byte == 58)) explicit = true;
+    if explicit return resolve_in_directory("", name, extensions);
+    path := environment_get_or("PATH", "").unwrap_or("");
+    defer path.free();
+    separator: u8 = 58;
+    #if OUT.os == .Windows separator = 59;
+    start: ssize = 0;
+    while start <= path.count {
+        end := start;
+        quoted := false;
+        while end < path.count {
+            #if OUT.os == .Windows if path[end] == 34 quoted = !quoted;
+            if !quoted && path[end] == separator break;
+            end += 1;
+        }
+        directory := path[start..end];
+        cleaned: String_Builder;
+        defer cleaned.free();
+        #if OUT.os == .Windows {
+            for byte: directory.bytes() if byte != 34 cleaned.write_byte(byte);
+            directory = cleaned.to_string();
+        }
+        if directory.count == 0 directory = ".";
+        found := resolve_in_directory(directory, name, extensions);
+        if found.count > 0 return found;
+        start = end + 1;
+    }
+    return empty;
+}
+
+/// Whether a path is a runnable file under the current platform rules.
+/// Windows consults current PATHEXT but only offers formats supported by
+/// Process/Command. Unix follows symlinks and checks execute access.
+is_executable :: (path: str) -> bool {
+    #if OUT.os == .Windows {
+        extensions := environment_get_or("PATHEXT", ".COM;.EXE;.BAT;.CMD").unwrap_or("");
+        defer extensions.free();
+        return executable_path(path, extensions);
+    } else return executable_path(path, "");
+}
+
+/// Return owned executable names matching prefix, sorted and deduplicated.
+/// Re-read PATH/PATHEXT each call so Lua environment edits take effect at once.
+/// Empty PATH entries are ignored; the current directory is searched only
+/// when PATH explicitly names it, matching direct executable lookup.
+candidates :: (prefix: str) -> [..]str {
+    names: [..]str;
+    for byte: prefix.bytes() if byte == 0 return names;
+    path := environment_get_or("PATH", "").unwrap_or("");
+    defer path.free();
+    extensions := environment_get_or("PATHEXT", ".COM;.EXE;.BAT;.CMD").unwrap_or("");
+    defer extensions.free();
+    separator: u8 = 58;
+    #if OUT.os == .Windows separator = 59;
+    start: ssize = 0;
+    while start <= path.count {
+        end := start;
+        quoted := false;
+        while end < path.count {
+            #if OUT.os == .Windows {
+                if path[end] == 34 quoted = !quoted;
+            }
+            if !quoted && path[end] == separator break;
+            end += 1;
+        }
+        directory := path[start..end];
+        #if OUT.os == .Windows {
+            unquoted: String_Builder;
+            defer unquoted.free();
+            for byte: directory.bytes() if byte != 34 unquoted.write_byte(byte);
+            directory = unquoted.to_string();
+            if directory.count > 0 append_directory(&names, directory, prefix, extensions);
+        } else {
+            if directory.count > 0 append_directory(&names, directory, prefix, extensions);
+        }
+        start = end + 1;
+    }
+    _ := names.sort_by(name_order);
+    written: ssize = 0;
+    for read: 0..names.count {
+        if written > 0 && same_name(names[written - 1], names[read]) names[read].free();
+        else {
+            names[written] = names[read];
+            written += 1;
+        }
+    }
+    names.count = written;
+    return names;
+}
+
+}

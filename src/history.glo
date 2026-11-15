@@ -1,0 +1,253 @@
+//! Append-only JSON-lines command history shared by interactive shells.
+#import "File_System/Directory";
+#import "File_System/Path";
+#import "File_System/File";
+#import "File_System/Metadata";
+#import "Serialization/Json";
+#import "String_Builder";
+#import "Strings/Utf8";
+#import "Memory/Ownership";
+#import "Context";
+#import "Format";
+#import "Time";
+
+#public {
+
+MAX_RECORD_BYTES :: 1_048_576;
+MAX_HISTORY_BYTES :: 8_388_608;
+MAX_HISTORY_ENTRIES :: 100_000;
+
+Store :: struct {
+    path: str;
+    enabled: bool;
+    limit: ssize = 1000;
+}
+
+Load :: struct {
+    commands: [..]str;
+    error: str;
+}
+
+// User-directory lookup does not create anything. In particular, use the
+// standard library's platform configuration location rather than guessing it.
+default_path :: () -> str {
+    if get_config_dir() == {
+    case ?directory;
+        defer directory.free();
+        native := directory.to_string();
+        defer native.free();
+        return path_join(native, "lush", "history.jsonl");
+    case null;
+        empty: str;
+        return empty;
+    }
+}
+
+release :: (store: *Store) {
+    store.path.free();
+    store.* = .{};
+}
+
+release_load :: (loaded: *Load) {
+    for command: loaded.commands command.free();
+    loaded.commands.free();
+    loaded.error.free();
+    loaded.* = .{};
+}
+
+// Load complete string records only. The file is streamed with bounded line
+// storage; an oversized or interrupted final record cannot prevent later use.
+load :: (path: str, limit: ssize = 1000) -> Load {
+    result: Load;
+    if path.count == 0 || limit <= 0 return result;
+    if path.has_nul() {
+        result.error = "history path contains NUL".clone();
+        return result;
+    }
+    if limit > MAX_HISTORY_ENTRIES limit = MAX_HISTORY_ENTRIES;
+    if metadata(path, true) == {
+    case .Ok(info);
+        if info.kind != .Regular {
+            result.error = tprint("history {} is not a regular file", path).clone();
+            return result;
+        }
+    case .Err(error);
+        if error.kind != .Not_Found result.error = file_error(path, "read", error);
+        return result;
+    }
+    file: File;
+    if File.open(path) == {
+    case .Ok(opened); file = opened;
+    case .Err(error);
+        if error.kind != .Not_Found result.error = file_error(path, "read", error);
+        return result;
+    }
+    defer file.free();
+    result.error = lock_file(&file, .Shared);
+    if result.error.count > 0 return result;
+    defer _ := file.unlock();
+    length: s64;
+    if file.seek(0, .End) == {
+    case .Ok(value); length = value;
+    case .Err(error); result.error = file_error(path, "seek", error); return result;
+    }
+    start: s64;
+    if length > MAX_HISTORY_BYTES start = length - MAX_HISTORY_BYTES;
+    skip_fragment := false;
+    if start > 0 {
+        preceding: [1]u8;
+        if file.read_at(preceding[..], start - 1) == {
+        case .Ok(read); skip_fragment = read != 1 || preceding[0] != 10;
+        case .Err(error); result.error = file_error(path, "read", error); return result;
+        }
+    }
+    if #pattern .Err(error) = file.seek(start) {
+        result.error = file_error(path, "seek", error);
+        return result;
+    }
+
+    ring: [..]str;
+    defer { for command: ring command.free(); ring.free(); }
+    empty: str;
+    for i: 0..limit ring.push(empty);
+    head: ssize;
+    count: ssize;
+    stored_bytes: ssize;
+    line: String_Builder;
+    defer line.free();
+    oversized := skip_fragment;
+    buffer: [8192]u8;
+    while true {
+        #temp_scope {
+            bytes: ssize;
+            if file.read_into(buffer[..]) == {
+            case .Ok(read); bytes = read;
+            case .Err(error);
+                if error.kind != .End_Of_File result.error = file_error(path, "read", error);
+                break;
+            }
+            for i: 0..bytes {
+                byte := buffer[i];
+                if byte == 10 {
+                    if !oversized {
+                        if json_deserialize(str, line.to_string(), .max_depth = 2) == {
+                        case .Ok(command);
+                            if command.trim().count == 0 command.free();
+                            else {
+                                while count > 0 && (count == limit || stored_bytes + command.count > MAX_HISTORY_BYTES) {
+                                    stored_bytes -= ring[head].count;
+                                    ring[head].free();
+                                    ring[head] = empty;
+                                    head = (head + 1) % limit;
+                                    count -= 1;
+                                }
+                                ring[(head + count) % limit] = command;
+                                stored_bytes += command.count;
+                                count += 1;
+                            }
+                        case .Err;
+                        }
+                    }
+                    line.clear();
+                    oversized = false;
+                } else if !oversized {
+                    if line.len() >= MAX_RECORD_BYTES {
+                        line.clear();
+                        oversized = true;
+                    } else line.write_byte(byte);
+                }
+            }
+        }
+    }
+    // No LF means the writer did not finish that record. Never recall it.
+    for i: 0..count result.commands.push(value_take(&ring[(head + i) % limit]));
+    return result;
+}
+
+// Empty on success, otherwise an owned nonfatal diagnostic. Callers decide
+// whether to warn; the in-memory interactive history remains usable either way.
+append :: (path: str, command: str) -> str {
+    empty: str;
+    if path.count == 0 || command.trim().count == 0 return empty;
+    if path.has_nul() return "history path contains NUL".clone();
+    if command.count > MAX_RECORD_BYTES return "command is too large for persistent history".clone();
+    encoded: str;
+    if json_serialize(command) == {
+    case .Ok(value); encoded = value;
+    case .Err; return "command cannot be encoded as JSON history".clone();
+    }
+    defer encoded.free();
+    if encoded.count > MAX_RECORD_BYTES return "encoded command is too large for persistent history".clone();
+    if metadata(path, true) == {
+    case .Ok(info);
+        if info.kind != .Regular return tprint("history {} is not a regular file", path).clone();
+    case .Err(error);
+        if error.kind != .Not_Found return file_error(path, "inspect", error);
+    }
+    parent := path_dirname(path);
+    if parent.count > 0 {
+        if #pattern .Err(error) = create_directory(parent,
+            .permissions = .Owner_Read | .Owner_Write | .Owner_Execute,
+            .make_parent = true)
+            return file_error(path, "create directory for", error);
+    }
+    file: File;
+    if File.open(path, .access = .Read_Write, .disposition = .Open_Or_Create,
+        .permissions = .Owner_Read | .Owner_Write, .flags = .Append) == {
+    case .Ok(opened); file = opened;
+    case .Err(error); return file_error(path, "append", error);
+    }
+    defer file.free();
+    locked := lock_file(&file, .Exclusive);
+    if locked.count > 0 return locked;
+    defer _ := file.unlock();
+    length: s64;
+    if file.seek(0, .End) == {
+    case .Ok(value); length = value;
+    case .Err(error); return file_error(path, "seek", error);
+    }
+    record: String_Builder;
+    defer record.free();
+    if length > 0 {
+        last: [1]u8;
+        if file.read_at(last[..], length - 1) == {
+        case .Ok(read);
+            if read != 1 return "could not inspect the end of history".clone();
+            if last[0] != 10 record.write_byte(10);
+        case .Err(error); return file_error(path, "read end of", error);
+        }
+    }
+    record.write_string(encoded);
+    record.write_byte(10);
+    remaining := record.to_string();
+    while remaining.count > 0 {
+        if file.write(remaining) == {
+        case .Ok(written);
+            if written <= 0 return "history write made no progress".clone();
+            remaining = remaining[written..];
+        case .Err(error); return file_error(path, "append", error);
+        }
+    }
+    return empty;
+}
+
+}
+
+file_error :: (path: str, operation: str, error: Fs_Error) -> str {
+    return tprint("could not {} history {}: {}", operation, path, error.kind.reason()).clone();
+}
+
+lock_file :: (file: *File, kind: File_Lock_Kind) -> str {
+    for attempt: 0..11 {
+        if file.lock(kind, .nonblocking = true) == {
+        case .Ok;
+            empty: str;
+            return empty;
+        case .Err(error);
+            if error.kind != .Would_Block && error.kind != .Busy && error.kind != .Permission_Denied
+                return tprint("could not lock history: {}", error.kind.reason()).clone();
+        }
+        if attempt < 10 _ := sleep_ns(5_000_000);
+    }
+    return "history is busy in another shell".clone();
+}

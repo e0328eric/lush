@@ -1,0 +1,103 @@
+//! Validated Lua settings for the interactive editor and history.
+Lua :: #import "lua.glo";
+#import "File_System/Path";
+#import "File_System/System";
+#import "Process/Environment";
+#import "Strings/Utf8";
+#import "Format";
+
+field :: (state: *void, table: s32, name: str) -> s32 {
+    Lua.push_text(state, name);
+    return Lua.raw_get(state, table);
+}
+
+#public {
+Settings :: struct {
+    path: str;
+    limit: ssize = 1000;
+    autosuggestions: bool = true;
+    syntax_highlighting: bool = true;
+    error: str;
+}
+release :: (settings: *Settings) {
+    settings.path.free();
+    settings.error.free();
+    settings.* = .{};
+}
+load :: (state: *void, startup_directory: str, default_history: str) -> Settings {
+    settings: Settings;
+    settings.path = default_history.clone();
+    if #pattern .Ok(value) = environment_get("LUSH_HISTORY_FILE") {
+        if #pattern ?entry = value {
+            defer entry.free();
+            settings.path.free();
+            settings.path = entry.value.clone();
+        }
+    }
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    if Lua.get_global(state, "lush".data) != 5 ||
+        Lua.get_field(state, -1, "config".data) != 5 {
+        settings.error = "lush.config must be a table".clone();
+        return settings;
+    }
+    table := Lua.get_top(state);
+    kind := field(state, table, "history_file");
+    if kind == 1 && Lua.to_boolean(state, -1) == 0 {
+        settings.path.free();
+        empty: str;
+        settings.path = empty;
+    } else if kind == 4 {
+        settings.path.free();
+        settings.path = Lua.text(state, -1).clone();
+    } else if kind != 0 {
+        settings.error = "lush.config.history_file must be a string or false".clone();
+        return settings;
+    }
+    Lua.pop(state);
+    if settings.path.has_nul() {
+        settings.error = "lush.config.history_file cannot contain NUL bytes".clone();
+        return settings;
+    }
+    #if OUT.os == .Windows {
+        // A drive-relative path depends on per-drive process state, which a
+        // startup config may have changed. Require its root to be explicit.
+        if settings.path.count >= 2 && settings.path[1] == 58 &&
+            (settings.path.count == 2 || (settings.path[2] != 47 && settings.path[2] != 92)) {
+            settings.error = "lush.config.history_file must use a rooted drive path, such as D:/history.jsonl".clone();
+            return settings;
+        }
+    }
+    if settings.path.count > 0 {
+        anchored := path_join(startup_directory, settings.path);
+        defer anchored.free();
+        if absolute(anchored) == {
+        case .Ok(path); settings.path.free(); settings.path = path;
+        case .Err(error);
+            settings.error = tprint("history path: {}", error.kind.reason()).clone();
+            return settings;
+        }
+    }
+    if field(state, table, "history_limit") != 0 {
+        valid: s32;
+        limit := Lua.to_integer(state, -1, &valid);
+        if Lua.value_type(state, -1) != 3 || valid == 0 || limit < 0 || limit > 100000 {
+            settings.error = "lush.config.history_limit must be an integer from 0 to 100000".clone();
+            return settings;
+        }
+        settings.limit = cast(ssize) limit;
+    }
+    Lua.pop(state);
+    kind = field(state, table, "autosuggestions");
+    if kind == 1 settings.autosuggestions = Lua.to_boolean(state, -1) != 0;
+    else if kind != 0
+        settings.error = "lush.config.autosuggestions must be a boolean".clone();
+    if settings.error.count > 0 return settings;
+    Lua.pop(state);
+    kind = field(state, table, "syntax_highlighting");
+    if kind == 1 settings.syntax_highlighting = Lua.to_boolean(state, -1) != 0;
+    else if kind != 0
+        settings.error = "lush.config.syntax_highlighting must be a boolean".clone();
+    return settings;
+}
+}

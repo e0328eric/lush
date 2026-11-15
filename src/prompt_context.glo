@@ -1,0 +1,385 @@
+//! Native facts for reusable prompt components. No shell evaluation or language runtimes.
+Lua :: #import "lua.glo";
+#import "Process";
+#import "Process/Command";
+#import "Process/System";
+#import "Process/Environment";
+#import "File_System/Directory";
+#import "File_System/File";
+#import "File_System/Temporary";
+#import "File_System/Metadata";
+#import "File_System/Path";
+#import "File_System/System";
+#import "Strings/Utf8";
+#import "String_Builder";
+#import "Time";
+
+#if OUT.os == .Windows {
+    kernel :: #library "kernel32";
+    security :: #library "advapi32";
+    current_process :: () -> *void #foreign kernel "GetCurrentProcess";
+    close_handle :: (handle: *void) -> s32 #foreign kernel "CloseHandle";
+    get_user_name :: (buffer: [*]u16, count: *u32) -> s32 #foreign security "GetUserNameW";
+    open_process_token :: (process: *void, access: u32, token: *?*void) -> s32
+        #foreign security "OpenProcessToken";
+    token_information :: (token: *void, kind: u32, output: *u32, size: u32, used: *u32) -> s32
+        #foreign security "GetTokenInformation";
+    Power_Status :: struct {
+        ac: u8;
+        flags: u8;
+        percent: u8;
+        reserved: u8;
+        life: u32;
+        full_life: u32;
+    }
+    power_status :: (status: *Power_Status) -> s32 #foreign kernel "GetSystemPowerStatus";
+} else #if OUT.os == .Linux || OUT.os == .Macos || OUT.os == .Freebsd {
+    libc :: #library "c";
+    // POSIX passwd starts with pw_name; no other platform-specific fields are read.
+    Account :: struct { name: ?[*]const u8; }
+    effective_user :: () -> u32 #foreign libc "geteuid";
+    account_for :: (id: u32) -> ?*Account #foreign libc "getpwuid";
+}
+
+// Lua 5.5 lua.h: LUA_REGISTRYINDEX = -(INT_MAX / 2 + 1000),
+// lua_upvalueindex(1) subtracts one. The private cache is owned by Lua.
+CACHE :: -1073742824;
+GIT_LIMIT :: 262144;
+GIT_TIMEOUT_NS :: 200000000;
+
+text_field :: (state: *void, name: str, value: str) {
+    Lua.push_text(state, value); Lua.set_field(state, -2, name.data);
+}
+integer_field :: (state: *void, name: str, value: s64) {
+    Lua.push_integer(state, value); Lua.set_field(state, -2, name.data);
+}
+boolean_field :: (state: *void, name: str, value: bool) {
+    Lua.push_boolean(state, ifx value 1 else 0); Lua.set_field(state, -2, name.data);
+}
+
+user_name :: () -> str {
+    #if OUT.os == .Windows {
+        units: [1024]u16;
+        count: u32 = 1024;
+        if get_user_name(units.data, &count) != 0 && count > 0 && count <= 1024 {
+            result: String_Builder;
+            defer result.free();
+            i: ssize;
+            while i + 1 < cast(ssize) count {
+                scalar := cast(u32) units[i];
+                i += 1;
+                if scalar >= 16#d800 && scalar <= 16#dbff && i + 1 < cast(ssize) count {
+                    low := cast(u32) units[i];
+                    if low >= 16#dc00 && low <= 16#dfff {
+                        scalar = 16#10000 + ((scalar - 16#d800) << 10) + low - 16#dc00;
+                        i += 1;
+                    }
+                }
+                result.write_rune(cast(rune) scalar);
+            }
+            return result.clone_string();
+        }
+    } else #if OUT.os == .Linux || OUT.os == .Macos || OUT.os == .Freebsd {
+        if #pattern ?account = account_for(effective_user()) {
+            if #pattern ?name = account.name {
+                length: ssize;
+                while length < 4096 && name[length] != 0 length += 1;
+                if length < 4096 return Lua.borrow_bytes(name, length).byte_slice_to_string().clone();
+            }
+        }
+    }
+    empty: str;
+    return empty;
+}
+admin_field :: (state: *void) {
+    #if OUT.os == .Windows {
+        token: ?*void;
+        if open_process_token(current_process(), 8, &token) == 0 return;
+        if #pattern ?handle = token {
+            defer _ := close_handle(handle);
+            elevated: u32;
+            used: u32;
+            if token_information(handle, 20, &elevated, 4, &used) != 0 && used == 4
+                boolean_field(state, "is_admin", elevated != 0);
+        }
+    } else #if OUT.os == .Linux || OUT.os == .Macos || OUT.os == .Freebsd {
+        boolean_field(state, "is_admin", effective_user() == 0);
+    }
+}
+number :: (text: str) -> s64 {
+    result: s64;
+    for byte: text.bytes() {
+        if byte < 48 || byte > 57 break;
+        if result > 922337203685477579 return 0;
+        result = result * 10 + cast(s64)(byte - 48);
+    }
+    return result;
+}
+battery_field :: (state: *void) {
+    #if OUT.os == .Windows {
+        status: Power_Status;
+        if power_status(&status) == 0 || status.percent > 100 || (status.flags & 128) != 0 return;
+        Lua.create_table(state, 0, 2);
+        integer_field(state, "percent", status.percent);
+        boolean_field(state, "charging", (status.flags & 8) != 0);
+        Lua.set_field(state, -2, "battery".data);
+    } else #if OUT.os == .Linux {
+        if #pattern .Ok(entries) = read_directory("/sys/class/power_supply") {
+            defer entries.free();
+            for entry: entries.entries {
+                base := path_join("/sys/class/power_supply", entry.name);
+                defer base.free();
+                type_path := path_join(base, "type");
+                defer type_path.free();
+                if #pattern .Ok(kind) = read_file_up_to(type_path, 128) {
+                    defer kind.free();
+                    if kind.trim() != "Battery" continue;
+                    capacity_path := path_join(base, "capacity");
+                    defer capacity_path.free();
+                    status_path := path_join(base, "status");
+                    defer status_path.free();
+                    if #pattern .Ok(capacity) = read_file_up_to(capacity_path, 128) {
+                        defer capacity.free();
+                        trimmed := capacity.trim();
+                        if trimmed.count == 0 || trimmed[0] < 48 || trimmed[0] > 57 continue;
+                        percent := number(trimmed);
+                        if percent > 100 continue;
+                        if #pattern .Ok(status) = read_file_up_to(status_path, 128) {
+                            defer status.free();
+                            value := status.trim();
+                            if value != "Charging" && value != "Discharging" && value != "Full" && value != "Not charging" continue;
+                            Lua.create_table(state, 0, 2);
+                            integer_field(state, "percent", percent);
+                            boolean_field(state, "charging", value == "Charging");
+                            Lua.set_field(state, -2, "battery".data);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+in_repository :: (cwd: str) -> bool {
+    if #pattern .Ok(?value) = environment_get("GIT_DIR") {
+        defer value.free();
+        if value.value.count > 0 return true;
+    }
+    current := cwd;
+    while current.count > 0 {
+        marker := path_join(current, ".git");
+        defer marker.free();
+        if exists(marker).unwrap_or(false) return true;
+        parent := path_dirname(current);
+        if parent == current break;
+        current = parent;
+    }
+    return false;
+}
+capture_git :: (cwd: str) -> str {
+    empty: str;
+    if !in_repository(cwd) return empty;
+    start: s64;
+    if Clock.Monotonic.now() == {
+    case .Err; return empty;
+    case .Ok(now); start = now.nanoseconds;
+    }
+    output: Temporary_File;
+    defer output.free();
+    errors: Temporary_File;
+    defer errors.free();
+    input: Temporary_File;
+    defer input.free();
+    if Temporary_File.create_temporary_file("", "lush-prompt-out-") == {
+    case .Err; return empty;
+    case .Ok(file); output = file;
+    }
+    if Temporary_File.create_temporary_file("", "lush-prompt-err-") == {
+    case .Err; return empty;
+    case .Ok(file); errors = file;
+    }
+    if Temporary_File.create_temporary_file("", "lush-prompt-in-") == {
+    case .Err; return empty;
+    case .Ok(file); input = file;
+    }
+    args: [8]str = .["--no-optional-locks", "-c", "core.fsmonitor=false", "status",
+        "--porcelain=v2", "--branch", "--show-stash", "--untracked-files=normal"];
+    command := Command.command_make("git", args[..]);
+    defer command.destroy();
+    command.set_working_directory(cwd);
+    command.no_window = true;
+    command.manage_tree = true;
+    command.group_mode = .New_Group;
+    _ := command.set_environment("GIT_TERMINAL_PROMPT", "0");
+    command.redirect_stdin(&input.file);
+    command.redirect_stdout(&output.file);
+    command.redirect_stderr(&errors.file);
+    child: Child;
+    if command.spawn() == {
+    case .Err; return empty;
+    case .Ok(value); child = value;
+    }
+    defer {
+        if child.valid { _ := child.kill(); _ := child.wait(); }
+        _ := child.close();
+    }
+    while true {
+        if child.poll() == {
+        case .Err; return empty;
+        case .Ok(?waited);
+            if waited.status.code != 0 || waited.status.signalled return empty;
+            break;
+        case .Ok(null);
+        }
+        if Clock.Monotonic.now() == {
+        case .Err; return empty;
+        case .Ok(now); if now.nanoseconds - start >= GIT_TIMEOUT_NS return empty;
+        }
+        if #pattern .Ok(info) = output.file.metadata() { if info.size > GIT_LIMIT return empty; }
+        if #pattern .Ok(info) = errors.file.metadata() { if info.size > GIT_LIMIT return empty; }
+        if sleep_ns(5000000).is_err() return empty;
+    }
+    if #pattern .Err = output.file.seek(0) return empty;
+    result: String_Builder;
+    defer result.free();
+    buffer: [8192]u8;
+    while result.len() <= GIT_LIMIT {
+        count: ssize;
+        if output.file.read_into(buffer[..]) == {
+        case .Err(error);
+            if error.kind == .End_Of_File return result.clone_string();
+            return empty;
+        case .Ok(read); count = read;
+        }
+        if count == 0 return result.clone_string();
+        if result.len() + count > GIT_LIMIT return empty;
+        result.write_string(buffer[..count].byte_slice_to_string());
+    }
+    return empty;
+}
+git_fields :: (state: *void, status: str) {
+    if status.count == 0 return;
+    lines := status.split("\n");
+    defer lines.free();
+    branch: str;
+    oid: str;
+    dirty: s64;
+    staged: s64;
+    ahead: s64;
+    behind: s64;
+    stash: s64;
+    for raw: lines {
+        line := raw.trim();
+        if line.starts_with("# branch.head ") branch = line[14..];
+        else if line.starts_with("# branch.oid ") oid = line[13..];
+        else if line.starts_with("# branch.ab ") {
+            parts := line[12..].split(" ");
+            defer parts.free();
+            for part: parts {
+                if part.starts_with("+") ahead = number(part[1..]);
+                else if part.starts_with("-") behind = number(part[1..]);
+            }
+        } else if line.starts_with("# stash ") stash = number(line[8..]);
+        else if line.starts_with("? ") dirty += 1;
+        else if line.count > 3 && (line[0] == 49 || line[0] == 50 || line[0] == 117) {
+            if line[2] != 46 staged += 1;
+            if line[3] != 46 dirty += 1;
+        }
+    }
+    if branch.count == 0 return;
+    Lua.create_table(state, 0, 6);
+    if branch == "(detached)" && oid.count >= 7 text_field(state, "branch", oid[..7]);
+    else text_field(state, "branch", branch);
+    integer_field(state, "dirty", dirty);
+    integer_field(state, "staged", staged);
+    integer_field(state, "ahead", ahead);
+    integer_field(state, "behind", behind);
+    integer_field(state, "stash", stash);
+    Lua.set_field(state, -2, "git".data);
+}
+git_field :: (state: *void, cwd: str, refresh: bool) {
+    now: s64;
+    if #pattern .Ok(value) = Clock.Monotonic.now() now = value.nanoseconds;
+    Lua.get_field(state, CACHE, "cwd".data);
+    same := Lua.value_type(state, -1) == 4 && Lua.text(state, -1) == cwd;
+    Lua.pop(state);
+    Lua.get_field(state, CACHE, "stamp".data);
+    stamp := Lua.to_integer(state, -1, null);
+    Lua.pop(state);
+    if !refresh && same && now > 0 && stamp > 0 && now >= stamp && now - stamp < 1000000000 {
+        Lua.get_field(state, CACHE, "status".data);
+        if Lua.value_type(state, -1) == 4 {
+            cached := Lua.text(state, -1);
+            // Keep the cache value alive while adding fields to the result table.
+            Lua.pop(state);
+            git_fields(state, cached);
+            return;
+        }
+        Lua.pop(state);
+    }
+    status := capture_git(cwd);
+    defer status.free();
+    Lua.push_text(state, cwd); Lua.set_field(state, CACHE, "cwd".data);
+    Lua.push_integer(state, now); Lua.set_field(state, CACHE, "stamp".data);
+    Lua.push_text(state, status); Lua.set_field(state, CACHE, "status".data);
+    git_fields(state, status);
+}
+native_context :: (state: *void) -> s32 {
+    include_git := Lua.value_type(state, 1) != 1 || Lua.to_boolean(state, 1) != 0;
+    refresh := Lua.to_boolean(state, 2) != 0;
+    Lua.create_table(state, 0, 10);
+    cwd: str;
+    defer cwd.free();
+    if #pattern .Ok(value) = current_path() cwd = value;
+    text_field(state, "cwd", cwd);
+    if #pattern ?home = get_home_dir() {
+        defer home.free();
+        native := home.to_string();
+        defer native.free();
+        text_field(state, "home", native);
+    }
+    user := user_name();
+    defer user.free();
+    text_field(state, "user", user);
+    host := host_name();
+    defer host.free();
+    text_field(state, "host", host);
+    #if OUT.os == .Windows text_field(state, "platform", "windows");
+    else text_field(state, "platform", "unix");
+    admin_field(state);
+    total := system_total_memory();
+    available := system_available_memory();
+    if total > 0 && available > 0 && available <= total {
+        Lua.create_table(state, 0, 2);
+        integer_field(state, "total", total);
+        integer_field(state, "used", total - available);
+        Lua.set_field(state, -2, "memory".data);
+    }
+    battery_field(state);
+    if environment_get("VIRTUAL_ENV") == {
+    case .Ok(?value);
+        defer value.free();
+        if value.value.count > 0 text_field(state, "python_env", path_basename(value.value));
+    else;
+    }
+    Lua.get_field(state, -1, "python_env".data);
+    has_python := Lua.value_type(state, -1) == 4;
+    Lua.pop(state);
+    if !has_python {
+        if #pattern .Ok(?value) = environment_get("CONDA_DEFAULT_ENV") {
+            defer value.free();
+            if value.value.count > 0 text_field(state, "python_env", value.value);
+        }
+    }
+    if include_git && cwd.count > 0 git_field(state, cwd, refresh);
+    return 1;
+}
+callback_context :: (state: *void) -> s32 #c_call { return native_context(state); }
+
+#public {
+install :: (state: *void) {
+    Lua.create_table(state, 0, 3);
+    Lua.push_callback(state, callback_context, 1);
+    Lua.set_field(state, -2, "prompt_context".data);
+}
+}

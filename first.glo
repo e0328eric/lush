@@ -1,0 +1,54 @@
+//! Build entry point, following the neighboring Glosso projects.
+#import "Compiler";
+#import "File_System/Directory";
+#import "File_System/Copy";
+#import "File_System/Path";
+#import "Glosso/Paths";
+#import "Format";
+#import "Io";
+#import "Strings/Utf8";
+
+#comptime {
+    set_current_output(false);
+    root := path_dirname(#source_location.filename);
+    if create_directory(path_join(root, "build"), .make_parent = true).is_err() {
+        print("lush: could not create build directory\n");
+        exit(1);
+    }
+    profile := Build_Profile.create("lush");
+    options := profile.options();
+    options.output_directory = path_join(root, "build");
+    options.output_name = "lush";
+    options.optimization_level = .O2;
+    options.add_compiler_arg(tprint("--std={}", GLOSSO_STANDARD_DIRECTORY));
+    options.add_compiler_arg(tprint("--cache-dir={}", path_join(root, "build/cache")));
+    profile.set_options(options);
+    if compile_file(path_join(root, "main.glo"), profile) == {
+    case .Ok(log); print("{}", log); print("Built build/lush\n");
+    case .Err(error); print("{}\n", error.message); exit(error.status);
+    }
+    for name: .["LICENSE", "THIRD_PARTY_NOTICES"] {
+        if copy_file(path_join(root, name), path_join(root, tprint("build/{}", name)), .Overwrite) == {
+        case .Ok;
+        case .Err(error); print("lush: could not copy {}: {}\n", name, error.kind); exit(1);
+        }
+    }
+    theme_output := path_join(root, "build", "themes");
+    if create_directory(theme_output, .make_parent = true).is_err() {
+        print("lush: could not create external theme directory\n");
+        exit(1);
+    }
+    theme_source := path_join(root, "themes");
+    if read_directory(theme_source) == {
+    case .Err(error); print("lush: could not read theme configs: {}\n", error.kind); exit(1);
+    case .Ok(entries);
+        for entry: entries.entries {
+            if !entry.name.ends_with(".lua") continue;
+            if copy_file(path_join(theme_source, entry.name), path_join(theme_output, entry.name), .Overwrite) == {
+            case .Ok;
+            case .Err(error); print("lush: could not package theme {}: {}\n", entry.name, error.kind); exit(1);
+            }
+        }
+    }
+}
+main :: () {}

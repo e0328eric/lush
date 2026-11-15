@@ -1,0 +1,703 @@
+//! Interactive Lua input. Raw terminal state is restored before running code.
+Runtime :: #import "runtime.glo";
+Lua :: #import "lua.glo";
+Native :: #import "native.glo";
+History :: #import "history.glo";
+History_Settings :: #import "history_settings.glo";
+Highlighting :: #import "highlighting.glo";
+Layout :: #import "repl_layout.glo";
+#import "Terminal";
+#import "Terminal/Text_Input";
+#import "Io";
+#import "Io/Terminal";
+#import "File_System/File";
+#import "Process/Signals";
+#import "String_Builder";
+#import "Strings/Utf8";
+#import "Context";
+#import "Format";
+#import "Memory/Ownership";
+
+Edited_Line :: struct {
+    text: str;
+    error: str;
+    eof: bool;
+    cancelled: bool;
+    unavailable: bool;
+}
+
+Input_Style :: struct {
+    state: *void;
+    pending: str; // Borrowed, unchanged for this editor invocation.
+    enabled: bool;
+    initialized: bool;
+    text: str;
+    mask: str;
+}
+
+refresh_highlight :: (style: *Input_Style, text: str) {
+    if !style.enabled || (style.initialized && style.text == text) return;
+    style.initialized = true;
+    style.text.free();
+    style.text = text.clone();
+    style.mask.free();
+    source: String_Builder;
+    defer source.free();
+    if style.pending.count > 0 {
+        source.write_string(style.pending);
+        source.write_string("\n");
+    }
+    source.write_string(text);
+    style.mask = Highlighting.mask(style.state, source.to_string());
+}
+
+scalar_bytes :: (scalar: u32) -> ssize {
+    if scalar < 16#80 return 1;
+    if scalar < 16#800 return 2;
+    if scalar < 16#10000 return 3;
+    return 4;
+}
+
+// Caught dispositions reset in exec'd Unix children. A Windows callback is
+// local to this process; unlike an ignored Ctrl+C disposition it is not
+// inherited by children sharing the console.
+on_interrupt :: (signal: s32) #c_call {}
+on_console_control :: (event: u32) -> s32 #c_call {
+    if event == 0 || event == 1 return 1;
+    return 0;
+}
+
+write_error :: (message: str) {
+    target := File.stderr();
+    remaining := message;
+    while remaining.count > 0 {
+        if target.write(remaining) == {
+        case .Err; return;
+        case .Ok(count);
+            if count <= 0 return;
+            remaining = remaining[count..];
+        }
+    }
+    _ := target.write("\n");
+}
+
+// Render one horizontal viewport rather than overwriting terminal scrollback.
+// Newlines in a pasted/multiline chunk are shown as a single visible marker.
+display_width :: (value: u32) -> ssize {
+    if value == 10 return 1;
+    return terminal_rune_width(value);
+}
+
+plain_prompt :: (text: str, limit: ssize) -> str {
+    result: String_Builder;
+    defer result.free();
+    cells: ssize = 0;
+    escape: s32 = 0;
+    for value: text {
+        scalar := cast(u32) value;
+        if escape == 1 {
+            if scalar == 91 escape = 2;
+            else if scalar == 93 escape = 3;
+            else escape = 0;
+            continue;
+        }
+        if escape == 2 {
+            if scalar >= 64 && scalar <= 126 escape = 0;
+            continue;
+        }
+        if escape == 3 {
+            if scalar == 7 escape = 0;
+            else if scalar == 27 escape = 4;
+            continue;
+        }
+        if escape == 4 {
+            if scalar == 92 escape = 0;
+            else escape = 3;
+            continue;
+        }
+        if scalar == 27 { escape = 1; continue; }
+        if scalar < 32 || (scalar >= 127 && scalar < 160) continue;
+        width := terminal_rune_width(scalar);
+        if cells + width > limit break;
+        result.write_rune(value);
+        cells += width;
+    }
+    return result.clone_string();
+}
+
+Prompt_Fragment :: struct { text: str; cells: ssize; }
+// Keep only SGR styles. Cursor controls, OSC payloads, and line breaks cannot
+// escape the prompt's measured row, including text from paths and Git branches.
+prompt_fragment :: (text: str, limit: ssize, colors: bool) -> Prompt_Fragment {
+    result: String_Builder;
+    defer result.free();
+    sequence: String_Builder;
+    defer sequence.free();
+    cells: ssize;
+    escape: s32;
+    valid := true;
+    for value: text {
+        scalar := cast(u32) value;
+        if escape == 1 {
+            if scalar == 91 {
+                escape = 2;
+                sequence.clear();
+                sequence.write_string("\x1b[");
+                valid = true;
+            } else if scalar == 93 || scalar == 80 || scalar == 94 || scalar == 95 escape = 3;
+            else escape = 0;
+            continue;
+        }
+        if escape == 2 {
+            if scalar >= 64 && scalar <= 126 {
+                if scalar == 109 && valid && colors {
+                    sequence.write_byte(109);
+                    result.write_string(sequence.to_string());
+                }
+                escape = 0;
+            } else if sequence.len() < 128 && ((scalar >= 48 && scalar <= 57) || scalar == 59 || scalar == 58)
+                sequence.write_rune(value);
+            else valid = false;
+            continue;
+        }
+        if escape == 3 {
+            if scalar == 7 escape = 0;
+            else if scalar == 27 escape = 4;
+            continue;
+        }
+        if escape == 4 {
+            if scalar == 92 escape = 0;
+            else escape = 3;
+            continue;
+        }
+        if scalar == 27 { escape = 1; continue; }
+        if scalar < 32 || (scalar >= 127 && scalar < 160) continue;
+        width := terminal_rune_width(scalar);
+        if cells + width > limit break;
+        result.write_rune(value);
+        cells += width;
+    }
+    return .{ .text = result.clone_string(), .cells = cells };
+}
+
+prompt_header_count :: (session: *Terminal_Session, prompt: *Runtime.Prompt) -> ssize {
+    rows := session.capabilities.rows;
+    if rows <= 0 rows = 24;
+    count := prompt.lines.count;
+    if count >= rows count = rows - 1;
+    return count;
+}
+
+// Borrow the newest longer history entry with the exact typed prefix.
+suggestion :: (input: *Terminal_Text_Input, history: []const str, enabled: bool) -> str {
+    empty: str;
+    if !enabled || input.values.count == 0 || input.cursor != input.values.count return empty;
+    prefix := input.text();
+    at := history.count;
+    while at > 0 {
+        at -= 1;
+        candidate := history[at];
+        if candidate.count <= prefix.count || !candidate.starts_with(prefix) continue;
+        // Imported history must preview exactly what set_text can accept.
+        // It normalizes tabs/CR and drops controls; oversized chunks truncate.
+        eligible := true;
+        scalars: ssize = 0;
+        for value: candidate {
+            scalar := cast(u32) value;
+            scalars += 1;
+            if scalars > input.limit ||
+                (scalar != 10 && (scalar < 32 || (scalar >= 127 && scalar < 160))) {
+                eligible = false;
+                break;
+            }
+        }
+        if eligible return candidate;
+    }
+    return empty;
+}
+
+redraw :: (session: *Terminal_Session, input: *Terminal_Text_Input, prompt: *Runtime.Prompt,
+    style: *Input_Style, footprint: *Layout.Footprint, candidate: str = "", geometry_only: bool = false) {
+    geometry := Layout.query(session);
+    wanted_headers := prompt_header_count(session, prompt);
+    repair := Layout.changed(footprint, geometry, wanted_headers);
+    if geometry_only && !repair return;
+    columns := geometry.columns;
+    if columns <= 0 columns = 80;
+    headers := ifx repair wanted_headers else 0;
+    colors := session.capabilities.color != .None;
+    label := prompt_fragment(prompt.input, columns / 2, colors);
+    defer label.text.free();
+    prompt_cells := label.cells;
+    available := columns - prompt_cells - 1;
+    if available < 1 available = 1;
+
+    // Select the longest suffix before the caret that leaves it visible.
+    start := input.cursor;
+    cursor_cells: ssize = 0;
+    while start > 0 {
+        previous := input.previous(start);
+        width: ssize = 0;
+        for i: previous..start width += display_width(input.values[i]);
+        if cursor_cells + width >= available break;
+        cursor_cells += width;
+        start = previous;
+    }
+    visible: String_Builder;
+    defer visible.free();
+    next_input: Layout.Row;
+    defer next_input.widths.free();
+    Layout.append_text(&next_input, label.text);
+    refresh_highlight(style, input.text());
+    byte_at: ssize;
+    if style.pending.count > 0 byte_at = style.pending.count + 1;
+    for i: 0..start byte_at += scalar_bytes(input.values[i]);
+    category: u8 = 48;
+    cells: ssize = 0;
+    for i: start..input.values.count {
+        scalar := input.values[i];
+        width := display_width(scalar);
+        if cells + width > available break;
+        next_category: u8 = 48;
+        if byte_at < style.mask.count next_category = style.mask[byte_at];
+        if next_category != category {
+            visible.write_string(Highlighting.color(next_category));
+            category = next_category;
+        }
+        if scalar == 10 visible.write_string("↵");
+        else visible.write_rune(cast(rune) scalar);
+        Layout.append_width(&next_input, width);
+        cells += width;
+        byte_at += scalar_bytes(scalar);
+    }
+    // Replace the prompt in one write. Clearing it in a separate console
+    // operation exposes a blank line between the erase and the new text.
+    frame: String_Builder;
+    defer frame.free();
+    frame.write_string("\x1b[?25l\r\x1b[0m");
+    if repair && footprint.valid Layout.recover(session, footprint, geometry, &frame);
+    for i: 0..headers {
+        Layout.reset_row(&footprint.header[i]);
+        row := prompt.lines[i];
+        right := prompt_fragment(row.right, columns / 2, colors);
+        defer right.text.free();
+        left := prompt_fragment(row.left, columns - right.cells - 2, colors);
+        defer left.text.free();
+        frame.write_string(left.text);
+        Layout.append_text(&footprint.header[i], left.text);
+        frame.write_string("\x1b[0m");
+        if right.cells > 0 {
+            frame.write_repeated_byte(32, columns - 1 - left.cells - right.cells);
+            frame.write_string(right.text);
+            Layout.append_spaces(&footprint.header[i], columns - 1 - left.cells - right.cells);
+            Layout.append_text(&footprint.header[i], right.text);
+        }
+        frame.write_string("\x1b[0m\x1b[K\r\n");
+    }
+    frame.write_string(label.text);
+    frame.write_string("\x1b[0m");
+    frame.write_string(visible.to_string());
+    frame.write_string("\x1b[0m");
+    if candidate.count > 0 && input.cursor == input.values.count {
+        prefix := input.text();
+        ghost: String_Builder;
+        defer ghost.free();
+        for value: candidate[prefix.count..] {
+            scalar := cast(u32) value;
+            width := display_width(scalar);
+            if cells + width > available break;
+            if scalar == 10 ghost.write_string("↵");
+            else if scalar >= 32 && !(scalar >= 127 && scalar < 160) ghost.write_rune(value);
+            else continue;
+            Layout.append_width(&next_input, width);
+            cells += width;
+        }
+        if ghost.len() > 0 {
+            frame.write_string("\x1b[2;90m");
+            frame.write_string(ghost.to_string());
+            frame.write_string("\x1b[0m");
+        }
+    }
+    frame.write_string("\x1b[K\r");
+    if prompt_cells + cursor_cells > 0
+        frame.writef("\x1b[{}C", prompt_cells + cursor_cells);
+    frame.write_string("\x1b[?25h");
+    if session.cursor_show(false).is_err() return;
+    // Leave cursor_hidden set on a failed write so session.end restores it.
+    if session.write(frame.to_string()).is_err() return;
+    footprint.input.widths.free();
+    footprint.input = value_take(&next_input);
+    footprint.columns = geometry.columns;
+    footprint.rows = geometry.rows;
+    footprint.buffer_columns = geometry.buffer_columns;
+    footprint.headers = wanted_headers;
+    footprint.caret_cells = prompt_cells + cursor_cells;
+    footprint.valid = true;
+    _ := session.cursor_show(true);
+    _ := session.flush();
+}
+
+// Complete the source before the caret. The Lua hook returns complete prefix
+// replacements, so quoted paths and cmd["names-with-hyphens"] need no parsing here.
+complete :: (state: *void, input: *Terminal_Text_Input, session: *Terminal_Session,
+    choices_printed: *bool, pending: str = "") -> bool {
+    before: String_Builder;
+    defer before.free();
+    after: String_Builder;
+    defer after.free();
+    for i: 0..input.cursor before.write_rune(cast(rune) input.values[i]);
+    for i: input.cursor..input.values.count after.write_rune(cast(rune) input.values[i]);
+    prefix := before.to_string();
+    suffix := after.to_string();
+    suffix_scalars := input.values.count - input.cursor;
+    top := Lua.get_top(state);
+    defer Lua.set_top(state, top);
+    if Lua.get_global(state, "lush".data) != 5 return false;
+    if Lua.get_field(state, -1, "complete".data) != 6 return false;
+    Lua.push_text(state, prefix);
+    Lua.push_nil(state); // Default cursor: end of this line's prefix.
+    Lua.push_text(state, pending);
+    if Lua.call(state, 3, 1, 0, 0, 0) != 0 || Lua.value_type(state, -1) != 5 return false;
+    count := cast(ssize) Lua.raw_length(state, -1);
+    if count < 1 return false;
+    matches_index := Lua.get_top(state);
+    Lua.raw_get_integer(state, -1, 1);
+    if Lua.value_type(state, -1) != 4 return false;
+    candidate := Lua.text(state, -1).clone();
+    defer candidate.free();
+    Lua.pop(state);
+    length := candidate.count;
+    for i: 2..=count {
+        Lua.raw_get_integer(state, -1, i);
+        if Lua.value_type(state, -1) != 4 return false;
+        other := Lua.text(state, -1);
+        if other.count < length length = other.count;
+        j: ssize = 0;
+        while j < length && candidate[j] == other[j] j += 1;
+        length = j;
+        Lua.pop(state);
+    }
+    while length > 0 && !candidate.is_char_boundary(length) length -= 1;
+    replacement := candidate[..length];
+    if count == 1 replacement = candidate;
+    if replacement != prefix && (count == 1 || length > prefix.count) {
+        scalars: ssize = 0;
+        for value: replacement scalars += 1;
+        if scalars + suffix_scalars > input.limit return false;
+        input.set_text(tprint("{}{}", replacement, suffix));
+        input.cursor = scalars;
+        return true;
+    }
+    if count == 1 return false;
+
+    // Show ambiguous candidates in a bounded grid; never run a candidate.
+    columns := session.capabilities.columns;
+    if columns <= 0 columns = 80;
+    rows := session.capabilities.rows - 2;
+    if rows < 1 rows = 1;
+    if rows > 12 rows = 12;
+    labels: [..]str;
+    defer { for label: labels label.free(); labels.free(); }
+    Lua.get_field(state, matches_index, "labels".data);
+    labels_index := Lua.get_top(state);
+    has_labels := Lua.value_type(state, labels_index) == 5;
+    limit := count;
+    if limit > 100 limit = 100;
+    widest: ssize = 1;
+    for i: 1..=limit {
+        Lua.raw_get_integer(state, ifx has_labels labels_index else matches_index, i);
+        label := plain_prompt(Lua.text(state, -1), columns / 2);
+        Lua.pop(state);
+        labels.push(label);
+        width := terminal_text_width(label);
+        if width > widest widest = width;
+    }
+    cell_width := widest + 2;
+    per_row := columns / cell_width;
+    if per_row < 1 per_row = 1;
+    shown := labels.count;
+    if shown > per_row * rows shown = per_row * rows;
+    choices_printed.* = true;
+    _ := session.write("\r\n");
+    for i: 0..shown {
+        _ := session.write(labels[i]);
+        if (i + 1) % per_row == 0 || i + 1 == shown _ := session.write("\r\n");
+        else {
+            padding: String_Builder;
+            defer padding.free();
+            padding.write_repeated_byte(32, cell_width - terminal_text_width(labels[i]));
+            _ := session.write(padding.to_string());
+        }
+    }
+    if shown < count _ := session.write(tprint("... {} more matches\r\n", count - shown));
+    return true;
+}
+
+read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, autosuggestions: bool,
+    syntax_highlighting: bool, pending: str) -> Edited_Line {
+    session: Terminal_Session;
+    if Terminal_Session.terminal_begin(.Raw | .Bracketed_Paste) == {
+    case .Ok(value); session = value;
+    case .Err; return .{ .unavailable = true };
+    }
+    defer session.free();
+    defer session.end();
+    input: Terminal_Text_Input;
+    input.limit = 1_048_576;
+    defer input.free();
+    style := Input_Style.{ .state = state, .pending = pending,
+        .enabled = syntax_highlighting && session.capabilities.color != .None };
+    defer style.text.free();
+    defer style.mask.free();
+    draft: str;
+    defer draft.free();
+    history_at := history.count;
+    footprint: Layout.Footprint;
+    defer Layout.release(&footprint);
+    redraw(&session, &input, prompt, &style, &footprint);
+    while true {
+        #temp_scope {
+            event := session.read_event();
+            if event.kind == .None {
+                if session.input_closed {
+                    _ := session.write("\r\n");
+                    return .{ .eof = true };
+                }
+                continue;
+            }
+            if event.kind == .Paste_Begin || event.kind == .Paste_End {
+                input.paste_cr = false;
+                continue;
+            }
+            if event.kind == .Resize {
+                redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions), true);
+                continue;
+            }
+            if event.kind != .Key continue;
+            // Resize records can sit behind already queued keys. Repair the
+            // previous paint before Tab output, submission, or editing uses it.
+            redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions), true);
+            key := event.key;
+            if !key.pasted && key.code == .Character && key.ctrl {
+                if key.rune == 108 {
+                    _ := session.clear();
+                    footprint.valid = false;
+                    redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions));
+                    continue;
+                }
+                if key.rune == 99 {
+                    if suggestion(&input, history, autosuggestions).count > 0
+                        redraw(&session, &input, prompt, &style, &footprint);
+                    _ := session.write("^C\r\n");
+                    return .{ .cancelled = true };
+                }
+                if key.rune == 100 {
+                    if input.values.count == 0 {
+                        _ := session.write("\r\n");
+                        return .{ .eof = true };
+                    }
+                    previous_count := input.values.count;
+                    input.erase(input.cursor, input.next(input.cursor));
+                    if input.values.count != previous_count
+                        redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions));
+                    continue;
+                }
+            }
+            if !key.pasted && key.code == .Enter && !key.alt && !key.shift {
+                if input.cursor != input.values.count || suggestion(&input, history, autosuggestions).count > 0 {
+                    input.cursor = input.values.count;
+                    redraw(&session, &input, prompt, &style, &footprint);
+                }
+                _ := session.write("\r\n");
+                return .{ .text = input.text().clone() };
+            }
+            changed := false;
+            if !key.pasted && key.code == .Right && !key.ctrl && !key.alt && !key.shift &&
+                input.cursor == input.values.count && suggestion(&input, history, autosuggestions).count > 0 {
+                input.set_text(suggestion(&input, history, autosuggestions));
+                changed = true;
+            } else if !key.pasted && key.code == .Up {
+                if history_at > 0 {
+                    if history_at == history.count {
+                        draft.free();
+                        draft = input.text().clone();
+                    }
+                    history_at -= 1;
+                    input.set_text(history[history_at]);
+                    changed = true;
+                }
+            } else if !key.pasted && key.code == .Down {
+                if history_at < history.count {
+                    history_at += 1;
+                    if history_at == history.count input.set_text(draft);
+                    else input.set_text(history[history_at]);
+                    changed = true;
+                }
+            } else if !key.pasted && key.code == .Tab {
+                choices_printed := false;
+                changed = complete(state, &input, &session, &choices_printed, style.pending);
+                if choices_printed {
+                    // The grid moved the edit line. Its prompt headers must
+                    // move with it before a resize can repaint relative rows.
+                    footprint.valid = false;
+                }
+            } else {
+                previous_count := input.values.count;
+                previous_cursor := input.cursor;
+                input.handle_key(key);
+                changed = input.values.count != previous_count || input.cursor != previous_cursor;
+            }
+            if changed redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions));
+        }
+    }
+}
+
+read_canonical :: (prompt: *Runtime.Prompt, show_prompt: bool) -> Edited_Line {
+    if show_prompt {
+        for line: prompt.lines {
+            text := plain_prompt(line.left, 78);
+            defer text.free();
+            print("{}\n", text);
+        }
+        text := plain_prompt(prompt.input, 40);
+        defer text.free();
+        print("{}", text);
+    }
+    source := File.stdin();
+    if source.read_line(1_048_576) == {
+    case .Err(error);
+        return .{ .error = tprint("stdin: {}", error.kind.reason()).clone() };
+    case .Ok(line);
+        if !line.has_input return .{ .eof = true };
+        if line.truncated return .{ .error = "input line exceeds 1 MiB".clone() };
+        return .{ .text = line.text.clone() };
+    }
+}
+
+#public {
+
+run :: (state: *void, startup_directory: str, default_history: str) -> s32 {
+    show_prompt := false;
+    input_file := File.stdin();
+    if #pattern .Ok(capabilities) = Terminal_Query(File).capabilities(&input_file)
+        show_prompt = capabilities.interactive;
+    settings: History_Settings.Settings;
+    defer History_Settings.release(&settings);
+    if show_prompt {
+        settings = History_Settings.load(state, startup_directory, default_history);
+        if settings.error.count > 0 {
+            Runtime.diagnostic(settings.error);
+            return 1;
+        }
+    }
+    #if OUT.os == .Windows {
+        protected_console := set_console_control_handler(on_console_control).is_ok();
+        defer if protected_console _ := set_console_control_handler(on_console_control, false);
+    } else {
+        previous: Process_Signal_Handler;
+        protected_interrupt := false;
+        if Process_Signal.Interrupt.install_handler(on_interrupt) == {
+        case .Ok(handler); previous = handler; protected_interrupt = true;
+        case .Err;
+        }
+        defer if protected_interrupt
+            _ := Process_Signal.Interrupt.install_handler(previous.previous);
+    }
+    history: [..]str;
+    defer { for text: history text.free(); history.free(); }
+    persistence_warned := false;
+    if show_prompt && settings.path.count > 0 && settings.limit > 0 {
+        loaded := History.load(settings.path, settings.limit);
+        defer History.release_load(&loaded);
+        history = value_take(&loaded.commands);
+        if loaded.error.count > 0 {
+            Runtime.diagnostic(loaded.error);
+            persistence_warned = true;
+        }
+    }
+    pending: String_Builder;
+    defer pending.free();
+    pending_error: str;
+    defer pending_error.free();
+    empty: str;
+    last_code := Runtime.last_status(state);
+    edited := true;
+
+    while !Native.requested_exit {
+        #temp_scope {
+            prompt: Runtime.Prompt;
+            if pending.buf.count != 0 prompt.input = "... ".clone();
+            else if show_prompt prompt = Runtime.prompt(state);
+            defer Runtime.release_prompt(&prompt);
+            line: Edited_Line;
+            if edited {
+                line = read_edited(state, &prompt, history.view(),
+                    settings.autosuggestions && pending.buf.count == 0,
+                    settings.syntax_highlighting, pending.to_string());
+                if line.unavailable edited = false;
+            }
+            if !edited line = read_canonical(&prompt, show_prompt);
+            defer line.text.free();
+            defer line.error.free();
+            if line.error.count > 0 {
+                write_error(line.error);
+                return 1;
+            }
+            if line.cancelled {
+                pending.clear();
+                pending_error.free();
+                pending_error = empty;
+                last_code = 130;
+                continue;
+            }
+            if line.eof {
+                if pending.buf.count != 0 {
+                    if pending_error.count > 0 write_error(pending_error);
+                    else write_error("unexpected end of input in incomplete Lua chunk");
+                    return 1;
+                }
+                return last_code;
+            }
+            if pending.buf.count == 0 && line.text.trim().count == 0 continue;
+            if pending.buf.count != 0 pending.write_string("\n");
+            pending.write_string(line.text);
+            checked := Runtime.check(state, pending.to_string(), "=stdin");
+            defer checked.message.free();
+            pending_error.free();
+            pending_error = empty;
+            if checked.incomplete {
+                pending_error = checked.message.clone();
+                continue;
+            }
+            text := pending.to_string();
+            if settings.limit > 0 && (history.count == 0 || history[history.count - 1] != text) {
+                if history.count >= settings.limit {
+                    history[0].free();
+                    for i: 1..history.count history[i - 1] = history[i];
+                    history.count -= 1;
+                }
+                history.push(text.clone());
+                if show_prompt && settings.path.count > 0 {
+                    error := History.append(settings.path, text);
+                    defer error.free();
+                    if error.count > 0 && !persistence_warned {
+                        Runtime.diagnostic(error);
+                        persistence_warned = true;
+                    }
+                }
+            }
+            // Save before executing, including commands that call os.exit().
+            evaluated := Runtime.evaluate(state, text, "=stdin", true);
+            defer evaluated.message.free();
+            pending.clear();
+            if evaluated.ok last_code = Runtime.last_status(state);
+            else {
+                write_error(evaluated.message);
+                last_code = 1;
+            }
+        }
+    }
+    return Native.requested_code;
+}
+
+}
