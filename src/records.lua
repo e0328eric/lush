@@ -50,6 +50,12 @@ schemas.command = {
     field("category", "string", "Command group, such as Filesystem or Data."),
     field("description", "string", "Short command description."),
 }
+schemas.alias = {
+    field("name", "string", "The Lua name registered in the prompt's global environment."),
+    field("kind", "string", "Alias target kind: function or external."),
+    field("command", "array", "Fixed executable and arguments for an external alias.", true,
+        {items = {type = "string"}}),
+}
 schemas.result = {
     field("ok", "boolean", "True when the command pipeline exited successfully."),
     field("code", "integer", "Pipeline exit code, using the rightmost nonzero stage status."),
@@ -155,6 +161,7 @@ schemas.producers = {
     stat = record(schemas.stat),
     version = record(schemas.version),
     commands = stream(schemas.command),
+    aliases = {type = "array", items = record(schemas.alias)},
     ["help.commands"] = stream(schemas.command),
     ["help.find"] = stream(schemas.command),
     run = record(schemas.result), capture = record(schemas.result),

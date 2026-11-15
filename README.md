@@ -628,6 +628,62 @@ open(".")         -- Windows: open the current directory
 open("https://example.com")
 ```
 
+## Aliases
+
+Register aliases in `init.lua` or `get_config_dir()/lush/aliases.lua`. The
+default `init.lua` loads `aliases.lua` when it exists. For an existing
+configuration, load that file with `source(path.join(lush.config_dir,
+"aliases.lua"))`.
+
+```lua
+alias("s", ls)
+alias("gst", {"git", "status", "--short"})
+alias({c = clear, gco = {"git", "checkout"}})
+```
+
+Names are ASCII Lua identifiers; Lua keywords, `_G`, and `lush` are reserved.
+Registrations may replace existing globals. Function aliases export the same
+function object. Command aliases copy a nonempty argument prefix and append
+call arguments literally, without shell splitting. Prefix arrays must be dense;
+strings and numbers are accepted, numbers become strings, and NUL is rejected.
+A bulk registration validates the entire map before applying it.
+
+Use normal Lua calls with parentheses:
+
+```lua
+s()
+gco("main")
+gst()       -- At the prompt, the returned command plan executes automatically.
+run(gst())  -- Scripts execute returned command plans explicitly.
+```
+
+A local function in a sourced file keeps its normal Lua scope. Export it with
+`alias()` so later prompt submissions can call it:
+
+```lua
+local function largest(limit)
+    return ls():sort_by("size", true):take(limit or 5)
+end
+alias("largest", largest)
+
+alias("glog", function(...)
+    return cmd.git("log", "--oneline", ...)
+end)
+```
+
+Return the value or command plan from a wrapper. Constructing a plan alone
+does not execute it. `_G.largest = largest` also exports a local function;
+`alias()` additionally registers its discovery metadata.
+
+`aliases()` returns a sorted array of active `{name, kind, command?}` records;
+external entries include a copied argument prefix. Replacing a registered
+global through ordinary Lua assignment removes it from this active catalog.
+`commands()` and `help("name")` reflect registrations immediately.
+`help("s")` describes the alias, while `help(s)` retains `help(ls)` because the
+functions have the same identity. Discovery never calls an alias function.
+The same registration and catalog functions are available as `lush.alias` and
+`lush.aliases`.
+
 ## Tests and organization
 
 ```sh

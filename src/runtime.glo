@@ -42,6 +42,7 @@ HIGHLIGHT :: #comptime embedded_source("highlight.lua");
 FILESYSTEM :: #comptime embedded_source("filesystem.lua");
 DATA :: #comptime embedded_source("data.lua");
 SHELL :: #comptime embedded_source("shell.lua");
+ALIASES :: #comptime embedded_source("aliases.lua");
 HELP :: #comptime embedded_source("help.lua");
 THEME :: #comptime embedded_source("theme.lua");
 
@@ -134,6 +135,7 @@ initialize :: (state: *void) -> bool {
         load_library(state, FILESYSTEM, "@lush/filesystem.lua") &&
         load_library(state, DATA, "@lush/data.lua") &&
         load_library(state, SHELL, "@lush/shell.lua") &&
+        load_library(state, ALIASES, "@lush/aliases.lua") &&
         load_library(state, THEME, "@lush/theme.lua") &&
         load_library(state, HELP, "@lush/help.lua") &&
         load_library(state, COMPLETION, "@lush/completion.lua") &&

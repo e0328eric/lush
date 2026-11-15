@@ -34,3 +34,13 @@ lush.config.syntax_highlighting = true
 -- permits the LUSH_HISTORY_FILE environment override.
 -- lush.config.history_file = false  -- Keep session history without saving.
 -- lush.config.history_file = "path/to/history.jsonl"
+
+-- Local functions become prompt commands when registered explicitly:
+-- local function home() cd(path.expand('~')) end
+-- alias {home = home, ll = function(...) return ls('-al', ...) end}
+-- Command argument arrays create lazy external commands: alias('v', {'nvim'}).
+-- Keep personal aliases in an optional, trusted aliases.lua beside this file.
+if type(lush.config_dir) == "string" and lush.config_dir ~= "" then
+    local aliases_file = path.join(lush.config_dir, "aliases.lua")
+    if exists(aliases_file) then source(aliases_file) end
+end

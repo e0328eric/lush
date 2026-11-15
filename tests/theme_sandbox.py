@@ -56,11 +56,12 @@ def main():
                   'assert(not message:find(string.char(27),1,true))')
         run('safe-api', '''local t=lush.theme
 assert(_G==_ENV and SANDBOX_HOST_SECRET==nil)
-for _,name in ipairs{'os','io','package','debug','require','source','cmd','run','capture','cat','open','env','_lush',
+for _,name in ipairs{'os','io','package','debug','require','source','cmd','run','capture','cat','open','alias','aliases','env','_lush',
  'load','loadfile','dofile','getmetatable','setmetatable','rawset','pcall','xpcall','coroutine','collectgarbage','print','warn'} do
  assert(_G[name]==nil,name)
 end
 assert(lush.theme.load==nil and lush.write==nil and lush.read==nil and lush.cat==nil and lush.open==nil and lush.cmd==nil)
+assert(lush.alias==nil and lush.aliases==nil)
 for _,name in ipairs{'match','gmatch','gsub','dump'} do assert(string[name]==nil and ('text')[name]==nil,name) end
 assert(string.find('a.b','.')==2 and ('a.b'):find('.')==2 and string.find('abc','.')==nil)
 assert(string.sub('abc',2)=='bc' and ('ab'):upper()=='AB' and ('x'):rep(3)=='xxx')

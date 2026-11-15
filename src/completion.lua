@@ -1,6 +1,10 @@
 -- Completion inspects Lua tokens and native directory/PATH snapshots. It never
 -- evaluates the input, indexes a metatable, or calls a user-provided function.
 local native = assert(_lush)
+local assert, error, ipairs, next, pairs, pcall, rawequal, rawget, tonumber, tostring, type =
+    assert, error, ipairs, next, pairs, pcall, rawequal, rawget, tonumber, tostring, type
+local math, string, table = math, string, table
+local documented_help, registered_aliases = lush.help, lush.aliases
 local keywords = {}
 for word in ("and break do else elseif end false for function global goto if in local nil not or " ..
              "repeat return then true until while"):gmatch("%S+") do keywords[word] = true end
@@ -649,11 +653,13 @@ function lush.complete(source, cursor, pending)
         if last and last.value == "(" then
             local target = receiver(tokens, #tokens - 1)
             local namespace = rawget(_G, "lush")
-            if target == rawget(_G, "help") or
-                (type(namespace) == "table" and target == rawget(namespace, "help")) then
+            if target == documented_help then
                 local names = {"commands", "find"}
                 for _, command in ipairs(rawget(namespace, "command_registry") or {}) do
                     names[#names + 1] = command.name
+                end
+                if registered_aliases then
+                    for _, entry in ipairs(registered_aliases()) do names[#names + 1] = entry.name end
                 end
                 table.sort(names)
                 for _, name in ipairs(names) do

@@ -9,7 +9,7 @@ for name in ("and break do else elseif end false for function global goto if in 
 for name in ("assert collectgarbage dofile error getmetatable ipairs load loadfile next pairs " ..
              "pcall print rawequal rawget rawlen rawset require select setmetatable tonumber " ..
              "tostring type warn xpcall coroutine debug io math os package string table utf8 " ..
-             "lush cmd ls sl pwd cd env run capture pipe stream where filter each map get take " ..
+             "lush alias aliases cmd ls sl pwd cd env run capture pipe stream where filter each map get take " ..
              "skip sort_by lines from_lines collect count to_json from_json to_text from to " ..
              "cat open save show echo exit help foreach"):gmatch("%S+") do builtins[name] = true end
 -- The command catalog is loaded before this module, so added builtins share

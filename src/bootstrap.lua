@@ -1,6 +1,12 @@
 -- Lush's standard-Lua shell library. Operating-system work lives in Glosso.
 local native = assert(_lush, "Lush native API is missing")
 local lua_select, lua_type = select, type
+-- Aliases may replace public Lua helper names. Builtin stream operations keep
+-- their original helpers so command discovery cannot accidentally call one.
+local getmetatable, setmetatable, pairs, ipairs, next, rawget, rawequal =
+    getmetatable, setmetatable, pairs, ipairs, next, rawget, rawequal
+local math = math
+local tonumber, tostring, error = tonumber, tostring, error
 local unpack = table.unpack
 local function pack(...) return {n = lua_select("#", ...), ...} end
 

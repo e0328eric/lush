@@ -1,4 +1,9 @@
 -- Command discovery and structured, Lua-oriented help.
+-- Alias registration may replace globals; discovery keeps its own helpers.
+local assert, error, getmetatable, ipairs, next, pairs, rawequal, rawget, tostring, type =
+    assert, error, getmetatable, ipairs, next, pairs, rawequal, rawget, tostring, type
+local math, string, table, utf8, stream = math, string, table, utf8, stream
+local active_aliases = rawget(lush, "aliases")
 local registry, by_name, by_function = {}, {}, {}
 local function add(name, category, description, details)
     details = details or {}
@@ -29,6 +34,21 @@ add("commands", "Shell", "List Lush commands as searchable name, category, and d
     usage = "commands(query?) / lush.commands(query?)", output = "Flow<{name, category, description}>",
     parameters = {"query: optional literal substring, matched without regard to case in names and descriptions."},
     examples = {"commands()", "commands('table'):select('name', 'description')"},
+    notes = "Includes active aliases registered after startup. An active alias replaces the same name's builtin catalog row.",
+})
+add("alias", "Shell", "Register a callable global alias for a Lua function or external-command prefix.", {
+    usage = "alias(name, function_or_argv) / alias({name = function_or_argv, ...})", output = "nil",
+    parameters = {"name: ASCII Lua identifier; keywords, _G, and lush are reserved.",
+                  "function_or_argv: function, or nonempty array of command/argument strings or numbers (numbers become strings).",
+                  "mapping: optional table registering several names together."},
+    examples = {"alias('s', ls)", "alias('gst', {'git', 'status', '--short'})",
+                "alias({s = ls, c = clear, gst = {'git', 'status', '--short'}})"},
+    notes = "Function aliases export the same function object, including local functions. Command prefixes are copied and create lazy command plans; extra call arguments are appended literally. Prefix arrays must be dense, the executable must be nonempty, and NUL is rejected. A bulk map is validated before any registration is applied. Call aliases with parentheses, such as s() and gst(). Function wrappers must return their values or command plan. The prompt displays/executes a returned plan; scripts use run(gst()). Put registrations in init.lua or its aliases.lua. Direct _G.name = local_function also exports a local function, while alias() registers discovery metadata. Existing globals may be replaced; lush.alias remains available if the global alias function is replaced.",
+})
+add("aliases", "Shell", "List the currently active registered aliases.", {
+    usage = "aliases() / lush.aliases()", output = "sorted array of {name, kind, command?} records",
+    examples = {"aliases()", "show(stream(aliases()):select('name', 'kind'))"},
+    notes = "kind is 'function' or 'external'; command is a copied argument-prefix array for external aliases. Each call returns a fresh snapshot. A registration is active while its global still holds the registered function. Normal Lua assignments that replace it remove that name from this catalog. commands() and help() include active registrations without executing them.",
 })
 add("source", "Shell", "Execute a Lua file in this shell and return its chunk's values.", {
     usage = "source(path, ...)", output = "the values returned by the Lua chunk",
@@ -303,6 +323,7 @@ add("lush", "Shell", "Access the shell API, configuration, and command discovery
         "config: prompt, persistent history, autosuggestions, and syntax colors; see help('lush.config').",
         "last_status: latest external pipeline status; successful Lua-only submissions reset it to zero.",
         "help(topic?), commands(query?): documentation and searchable builtin commands; command_registry holds a metadata snapshot.",
+        "alias(name, function_or_argv), alias(mapping), aliases(): register and discover active global aliases.",
         "cmd, run, capture, pipe: construct and execute external commands and pipelines.",
         "ls, pwd, cd, mkdir, touch, cp, mv, rm, stat, exists: filesystem builtin functions.",
         "cat(path), read(path), write(path, bytes, append?): direct file I/O; read is an alias for cat().",
@@ -473,10 +494,53 @@ local function string_argument(value, label)
     if value:find("\0", 1, true) then error(label .. " cannot contain NUL", 3) end
     return value
 end
+local function alias_documents()
+    local rows, named = {}, {}
+    if type(active_aliases) ~= "function" then return rows, named end
+    for _, entry in ipairs(active_aliases()) do
+        local value = rawget(_G, entry.name)
+        if type(value) == "function" then
+            local canonical = by_function[value]
+            local command = canonical and copy(canonical) or {
+                parameters = {"...: arguments forwarded to the alias."}, flags = {}, input = "nothing",
+                examples = {entry.name .. "()"},
+            }
+            command.name, command.category, command.usage = entry.name, "Aliases", entry.name .. "(...)"
+            if canonical then
+                command.alias_for = canonical.name
+                command.description = "Alias for " .. canonical.name .. ": " .. canonical.description
+                command.notes = "Alias for " .. canonical.name .. ". " .. canonical.notes
+            elseif entry.kind == "external" then
+                local arguments = {}
+                for index, argument in ipairs(entry.command) do arguments[index] = string.format("%q", argument) end
+                command.description = "External command alias for " .. string.format("%q", entry.command[1]) .. "."
+                command.output = "Exec (lazy command plan)"
+                command.examples = {entry.name .. "()", "run(" .. entry.name .. "())"}
+                command.notes = "Command prefix: {" .. table.concat(arguments, ", ") .. "}. " ..
+                    "Extra arguments are appended literally. At the prompt, returned command plans execute automatically; scripts use run(" .. entry.name .. "())."
+            else
+                command.description = "Alias for a Lua function."
+                command.output = "values returned by the registered function"
+                command.notes = "Calls the registered Lua function with the supplied arguments and returns its values. " ..
+                    "A wrapper for an external command must return its command plan; scripts execute that plan with run()."
+            end
+            rows[#rows + 1], named[entry.name] = command, command
+        end
+    end
+    return rows, named
+end
+local function current_commands()
+    local combined, rows = {}, {}
+    for _, command in ipairs(registry) do combined[command.name] = command end
+    for _, command in ipairs(alias_documents()) do combined[command.name] = command end
+    for _, command in pairs(combined) do rows[#rows + 1] = command end
+    table.sort(rows, function(left, right) return left.name < right.name end)
+    return rows
+end
 function lush.commands(query)
     if query ~= nil then query = string_argument(query, "command query"):lower() end
     local rows = {}
-    for _, command in ipairs(registry) do
+    for _, command in ipairs(current_commands()) do
         local searchable = (command.name .. "\n" .. command.description):lower()
         if not query or searchable:find(query, 1, true) then
             rows[#rows + 1] = {name = command.name, category = command.category, description = command.description}
@@ -672,7 +736,7 @@ local function inspect_table(value)
 end
 local function overview()
     local groups = {}
-    for _, command in ipairs(registry) do
+    for _, command in ipairs(current_commands()) do
         groups[command.category] = groups[command.category] or {}
         groups[command.category][#groups[command.category] + 1] = command.name
     end
@@ -729,6 +793,9 @@ function help(topic, query)
         if query ~= nil then error("a help query applies only to 'commands' or 'find'", 2) end
         local command = by_function[topic]
         if command then return detailed(command) end
+        for _, registered in ipairs(alias_documents()) do
+            if rawequal(rawget(_G, registered.name), topic) then return detailed(registered) end
+        end
         error("no help is registered for this function. Browse documented functions with help('commands').", 2)
     end
     if type(topic) == "table" then
@@ -743,12 +810,13 @@ function help(topic, query)
     end
     if query ~= nil then error("a help query applies only to 'commands' or 'find'", 2) end
     if topic == "" then return overview() end
-    local command = by_name[topic] or by_name[topic:gsub(":", ".")]
+    local _, registered = alias_documents()
+    local command = registered[topic] or by_name[topic] or by_name[topic:gsub(":", ".")]
     if not command and topic:sub(1, 5) == "lush." then command = by_name[topic:sub(6)] end
     if command then return detailed(command) end
     local choices = {}
     if #topic <= 128 then
-        for _, candidate in ipairs(registry) do
+        for _, candidate in ipairs(current_commands()) do
             local score = distance(topic:lower(), candidate.name:lower())
             if score <= math.max(1, math.min(3, math.floor(#topic / 3))) then
                 choices[#choices + 1] = {name = candidate.name, score = score}
