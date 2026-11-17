@@ -10,7 +10,6 @@
 #import "File_System/File";
 #import "File_System/Types";
 #import "File_System/System";
-#import "File_System/Directory";
 #import "File_System/Metadata";
 #import "Process/Environment";
 #import "Memory/Ownership";
@@ -19,6 +18,7 @@
 #import "entry.glo";
 #import "options.glo";
 #import "git.glo";
+#import "directory_size.glo";
 
 #public {
 
@@ -246,37 +246,13 @@ apply_git :: (r: *Render, entries: []Entry) {
 
 apply_total_sizes :: (r: *Render, entries: []Entry) {
     if !r.options.total_size || r.options.layout != .Long return;
+    scan := Size_Scan.start(r.tty);
+    defer scan.clear();
     for *e: entries {
         if e.stat_ok && e.meta.kind == .Directory && e.name != ".." {
-            // An unreadable directory keeps showing "-".
-            if read_directory(e.path) == {
-            case .Ok(list);
-                list.free();
-                e.total_size = directory_size(e.path, 0);
-            case .Err;
-            }
+            e.total_size = scan.measure(e.path).unwrap_or(-1);
         }
     }
-}
-
-/// Recursive apparent size of a directory, not following symbolic links.
-directory_size :: (path: str, depth: s64) -> s64 {
-    if depth > 64 return 0;
-    #pattern .Ok(list) := read_directory(path) else {
-        return 0;
-    };
-    defer list.free();
-    total: s64 = 0;
-    for item: list.entries {
-        child := join_path(path, item.name);
-        defer child.free();
-        #pattern .Ok(m) := metadata(child) else {
-            continue;
-        };
-        if m.kind == .Directory total += directory_size(child, depth + 1);
-        else total += m.size;
-    }
-    return total;
 }
 
 render_listing :: (r: *Render, entries: []Entry) {

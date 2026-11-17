@@ -1,5 +1,9 @@
 //! Filesystem builtins backed by the portable standard library.
 Lua :: #import "lua.glo";
+Home :: #import "home_path.glo";
+Copy_Progress :: #import "copy_progress.glo";
+Remove_Progress :: #import "remove_progress.glo";
+Progress :: #import "progress_display.glo";
 #import "File_System/Directory";
 #import "File_System/File";
 #import "File_System/Copy";
@@ -93,14 +97,14 @@ native_cp :: (state: *void) -> s32 {
     if metadata(source, false) == {
     case .Err(error); return fs_failure(state, error);
     case .Ok(info);
-        if info.kind == .Directory {
-            if !boolean(state, 3) return failure(state, "cp: directory source requires recursive=true");
-            if #pattern .Err(error) = copy_tree(source, destination, .policy = policy)
-                return fs_failure(state, error);
-        } else {
-            if #pattern .Err(error) = copy_file(source, destination, .policy = policy)
-                return fs_failure(state, error);
-        }
+        if info.kind == .Directory && !boolean(state, 3)
+            return failure(state, "cp: directory source requires recursive=true");
+        bar := Progress.Terminal_Bar.start();
+        notify: ?Copy_Progress.Progress;
+        if bar.interactive notify = ?Progress.update;
+        result := Copy_Progress.copy(source, destination, info, policy, notify, cast(*void) &bar);
+        Progress.finish_copy(&bar, result.is_ok());
+        if #pattern .Err(error) = result return failure(state, Copy_Progress.error_message(error));
     }
     return success(state);
 }
@@ -118,9 +122,15 @@ native_rm :: (state: *void) -> s32 {
     path := Lua.text(state, 1);
     force := boolean(state, 3);
     if boolean(state, 2) {
-        if remove_all(path) == {
-        case .Err(error); return fs_failure(state, error);
+        bar := Progress.Terminal_Bar.start();
+        notify: ?Remove_Progress.Progress;
+        if bar.interactive notify = ?Progress.deleted;
+        if Remove_Progress.remove_tree(path, notify, &bar) == {
+        case .Err(error);
+            Progress.finish_delete(&bar, error.completed, false);
+            return fs_failure(state, error);
         case .Ok(count);
+            Progress.finish_delete(&bar, count, count > 0 || force);
             if count == 0 && !force return failure(state, tprint("{}: not found", path));
         }
     } else {
@@ -185,16 +195,26 @@ native_path :: (state: *void) -> s32 {
         normalized := path_clean(path);
         defer normalized.free();
         Lua.push_text(state, normalized);
-    } else if operation == "expand" || operation == "absolute" {
-        expanded: str;
-        defer expanded.free();
+    } else if operation == "home" || operation == "expand" || operation == "absolute" {
+        uses_home := operation != "absolute" && Home.has_prefix(path);
+        if uses_home path = path[1..];
+        variables: str;
+        defer variables.free();
         if operation == "expand" {
             if path_expand(path) == {
             case .Err(error); return failure(state, tprint("path.expand: {}", error.kind));
-            case .Ok(value); expanded = value;
+            case .Ok(value); variables = value; path = variables;
             }
-        } else expanded = path.clone();
-        if absolute(expanded) == {
+        }
+        expanded: str;
+        defer expanded.free();
+        if uses_home {
+            #pattern ?value := Home.from_home(path) else { return failure(state, Home.unavailable()); };
+            expanded = value;
+            path = expanded;
+        }
+        if operation == "home" { Lua.push_text(state, path); return 1; }
+        if absolute(path) == {
         case .Err(error); return fs_failure(state, error);
         case .Ok(value); defer value.free(); Lua.push_text(state, value);
         }

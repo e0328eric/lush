@@ -1,5 +1,6 @@
 //! Native facts for reusable prompt components. No shell evaluation or language runtimes.
 Lua :: #import "lua.glo";
+Home :: #import "home_path.glo";
 #import "Process";
 #import "Process/Command";
 #import "Process/System";
@@ -332,12 +333,9 @@ native_context :: (state: *void) -> s32 {
     defer cwd.free();
     if #pattern .Ok(value) = current_path() cwd = value;
     text_field(state, "cwd", cwd);
-    if #pattern ?home = get_home_dir() {
-        defer home.free();
-        native := home.to_string();
-        defer native.free();
-        text_field(state, "home", native);
-    }
+    home := Home.directory();
+    defer home.free();
+    if home.count > 0 text_field(state, "home", home);
     user := user_name();
     defer user.free();
     text_field(state, "user", user);

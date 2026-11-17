@@ -31,6 +31,12 @@ local function text(value, name)
     if value:find("\0", 1, true) then fail((name or "argument") .. " contains NUL", 2) end
     return value
 end
+local function path_arg(value, name)
+    text(value, name or "path")
+    if value:sub(1, 1) == "~" then return checked(native.path("home", value)) end
+    return value
+end
+native.path_arg = path_arg
 local function integer(value, name)
     if math.type(value) ~= "integer" or value < 0 then
         fail((name or "argument") .. " must be a nonnegative integer", 2)
@@ -231,6 +237,7 @@ local function command(argv)
         copy[i] = text(arg, "command argument " .. i)
     end
     if copy[1] == "" then fail("executable must not be empty", 2) end
+    copy[1] = path_arg(copy[1], "executable")
     return setmetatable({commands = {copy}}, Exec)
 end
 local function argv_call(name, ...)
@@ -521,26 +528,30 @@ end
 function sl(...)
     return ls("--lol", ...)
 end
-function pwd() return checked(native.cwd()) end
+function pwd()
+    local directory = checked(native.cwd())
+    if native.platform == "windows" then directory = directory:gsub("\\", "/") end
+    return directory
+end
 function echo(...)
     local values = {}
     for i = 1, lua_select("#", ...) do values[i] = tostring(lua_select(i, ...)) end
     io.write(table.concat(values, " "), "\n")
 end
 function cd(path)
-    if path == nil then path = native.env_get("HOME") or native.env_get("USERPROFILE") end
-    checked(native.cd(text(path, "directory")))
+    if path == nil then path = "~" end
+    checked(native.cd(path_arg(path, "directory")))
 end
 function cat(path)
-    return checked(native.read(text(path, "path")))
+    return checked(native.read(path_arg(path)))
 end
 function open(target)
-    text(target, "open target")
+    target = path_arg(target, "open target")
     if target == "" then fail("open target must not be empty") end
     return checked(native.open(target))
 end
 function save(path, append)
-    text(path, "path")
+    path = path_arg(path)
     return stage(function(input) checked(native.write(path, bytes(input), not not append)); return nil end)
 end
 env = setmetatable({}, {
@@ -702,7 +713,7 @@ function lush.prompt()
         return rendered
     end
     local directory = native.cwd() or "?"
-    local home = native.env_get("HOME") or native.env_get("USERPROFILE")
+    local home = native.path("home", "~")
     if home and directory:sub(1, #home) == home and
         (#directory == #home or directory:sub(#home + 1, #home + 1):match("[/\\]")) then
         directory = "~" .. directory:sub(#home + 1)
@@ -778,6 +789,6 @@ lush.lines, lush.collect, lush.count = lines, collect, count
 lush.to_json, lush.from_json, lush.to_text, lush.show = to_json, from_json, to_text, show
 lush.cat, lush.open, lush.read = cat, open, cat
 lush.write = function(path, contents, append)
-    return checked(native.write(text(path, "path"), contents, not not append))
+    return checked(native.write(path_arg(path), contents, not not append))
 end
 package.loaded.lush = lush

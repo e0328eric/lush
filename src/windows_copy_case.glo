@@ -1,0 +1,156 @@
+//! Copying Linux source trees on NTFS can require distinct names such as
+//! xt_MARK.h and xt_mark.h inside the same directory.
+#import "File_System/Types";
+
+#if OUT.os == .Windows {
+    #import "File_System/Directory";
+    #import "File_System/Path";
+    #import "File_System/System";
+    #import "Sort/Algorithms";
+    #import "Strings/Utf16";
+    #import "Strings/Utf8";
+    #import "Memory/Ownership";
+    #import "Context";
+    #import "Format";
+
+    kernel :: #library "kernel32";
+    open :: (path: [*]const u16, access: u32, share: u32, security: ?*void,
+        creation: u32, flags: u32, template: ?*void) -> ssize #foreign kernel "CreateFileW";
+    close :: (handle: ssize) -> s32 #foreign kernel "CloseHandle";
+    last_error :: () -> u32 #foreign kernel "GetLastError";
+    get_info :: (handle: ssize, kind: u32, value: *u32, size: u32) -> s32
+        #foreign kernel "GetFileInformationByHandleEx";
+    set_info :: (handle: ssize, kind: u32, value: *u32, size: u32) -> s32
+        #foreign kernel "SetFileInformationByHandle";
+    compare_names :: (a: [*]const u16, a_len: s32, b: [*]const u16, b_len: s32,
+        ignore_case: s32) -> s32 #foreign kernel "CompareStringOrdinal";
+
+    FILE_CASE_SENSITIVE_INFO :: 23;
+
+    // UTF-16 for the duration of the caller's temporary scope.
+    #public wide_path :: (path: str) -> Fs_Error!cstring16 {
+        text := path;
+        root := path_parse_root(path);
+        if !root.verbatim && (path.count >= 248 || !root.absolute) {
+            full := absolute(path, context.temp_allocator)?;
+            if full.count >= 248 {
+                full_root := path_parse_root(full);
+                if full_root.kind == .Windows_Drive_Absolute text = tprint("\\\\?\\{}", full);
+                else if full_root.kind == .Windows_Unc text = tprint("\\\\?\\UNC\\{}", full[2..]);
+            }
+        }
+        wide := text.cstring16_from_string(context.temp_allocator);
+        if cast(usize) wide.data == 0 return .Err(Fs_Error.make_error(.Out_Of_Memory, .Copy, 0, path));
+        return .Ok(wide);
+    }
+
+    directory_handle :: (path: str, access: u32) -> Fs_Error!ssize {
+        #temp_scope {
+            wide := wide_path(path)?;
+            // BACKUP_SEMANTICS opens directories. OPEN_REPARSE_POINT prevents
+            // retargeting a symlink's referent if the destination is replaced.
+            handle := open(wide.data, access, 7, null, 3, 16#0220_0000, null);
+            if handle == -1 return .Err(fs_error_from_os(last_error(), .Copy, path));
+            return .Ok(handle);
+        }
+    }
+
+    flags_of :: (path: str) -> Fs_Error!?u32 {
+        handle := directory_handle(path, 0)?;
+        defer _ := close(handle);
+        flags: u32;
+        if get_info(handle, FILE_CASE_SENSITIVE_INFO, &flags, 4) != 0 return .Ok(?flags);
+        code := last_error();
+        // Older Windows versions and some remote filesystems have no such flag.
+        if code == 1 || code == 50 || code == 87 || code == 124 return .Ok(null);
+        return .Err(fs_error_from_os(code, .Copy, path));
+    }
+
+    change_flags :: (path: str, flags: u32) -> s64 {
+        // WRITE_ATTRIBUTES, ADD_FILE, ADD_SUBDIRECTORY and DELETE_CHILD.
+        if directory_handle(path, 16#146) == {
+        case .Err(error); return ifx error.os_code != 0 error.os_code else 8;
+        case .Ok(handle);
+            defer _ := close(handle);
+            if set_info(handle, FILE_CASE_SENSITIVE_INFO, &flags, 4) == 0 return last_error();
+            return 0;
+        }
+    }
+
+    Name :: struct { text: str; wide: cstring16; }
+
+    compare :: (a: *const Name, b: *const Name) -> Ordering {
+        return compare_names(a.wide.data, -1, b.wide.data, -1, 1) <=> 2;
+    }
+
+    // An existing merge target keeps its own lookup policy. If a newly
+    // created target could not adopt the source's flag, the same check lets
+    // representable trees copy and detects conflicting names before writes.
+    check_names :: (source: str, destination: str, code: s64,
+        checked_entries: ?*?Directory_List) -> Fs_Error!void {
+        entries := read_directory(source)?;
+        defer entries.free();
+        names: [..]Name;
+        defer {
+            for name: names name.wide.free();
+            names.free();
+        }
+        for entry: entries.entries {
+            wide := entry.name.cstring16_from_string();
+            if cast(usize) wide.data == 0 return .Err(Fs_Error.make_error(.Out_Of_Memory, .Copy, 0, source, destination));
+            names.push(.{ .text = entry.name, .wide = wide });
+        }
+        _ := names[..].pdq_sort_by(compare);
+        for i: 1..names.count {
+            if compare(&names[i - 1], &names[i]) == .Equal {
+                first := path_join(source, names[i - 1].text, .allocator = context.temp_allocator);
+                second := path_join(destination, names[i].text, .allocator = context.temp_allocator);
+                return .Err(Fs_Error.make_error(.Already_Exists, .Change_Mode, code, first, second));
+            }
+        }
+        // Another process can add a case-only sibling after this check.
+        // Hand the copier precisely the owned entries that passed it.
+        if #pattern ?output = checked_entries output.* = ?value_take(&entries);
+        return .Ok;
+    }
+}
+
+#public prepare :: (source: str, destination: str, newly_created: bool,
+    checked_entries: ?*?Directory_List = null) -> Fs_Error!void {
+    #if OUT.os == .Windows {
+        source_flags := flags_of(source)?;
+        dest_flags := flags_of(destination)?;
+        src := source_flags.unwrap_or(0) & 1;
+        dst := dest_flags.unwrap_or(0) & 1;
+        if src == dst {
+            if dst == 0 && source_flags == null return check_names(source, destination, 0, checked_entries);
+            return .Ok;
+        }
+        code: s64;
+        if newly_created && dest_flags != null {
+            code = change_flags(destination, src);
+            if code == 0 return .Ok;
+        }
+        if dst == 0 {
+            result := check_names(source, destination, code, checked_entries);
+            if !newly_created && dest_flags != null {
+                // An elevated retry may find the empty directory left by a
+                // previous copy. Only adopt the flag if two names require it.
+                if #pattern .Err(conflict) = result {
+                    if conflict.operation != .Change_Mode return result;
+                    dir := Directory.open_directory(destination)?;
+                    defer dir.free();
+                    first := dir.next()?;
+                    _ := dir.close()?;
+                    if first == null {
+                        conflict.os_code = change_flags(destination, src);
+                        if conflict.os_code == 0 return .Ok;
+                        return .Err(conflict);
+                    }
+                }
+            }
+            return result;
+        }
+    }
+    return .Ok;
+}

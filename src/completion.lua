@@ -1,6 +1,7 @@
 -- Completion inspects Lua tokens and native directory/PATH snapshots. It never
 -- evaluates the input, indexes a metatable, or calls a user-provided function.
 local native = assert(_lush)
+local path_arg = native.path_arg
 local assert, error, ipairs, next, pairs, pcall, rawequal, rawget, tonumber, tostring, type =
     assert, error, ipairs, next, pairs, pcall, rawequal, rawget, tonumber, tostring, type
 local math, string, table = math, string, table
@@ -162,6 +163,9 @@ local function starts_with(value, prefix)
     return value:sub(1, #prefix) == prefix
 end
 local function file_candidates(prefix, directories_only, executables_only)
+    if prefix == "~" and native.path("home", prefix) then
+        return {{value = "~/", label = "~/"}}
+    end
     local separator
     for i = #prefix, 1, -1 do
         local c = prefix:sub(i, i)
@@ -170,7 +174,7 @@ local function file_candidates(prefix, directories_only, executables_only)
     local directory = separator and prefix:sub(1, separator) or ""
     local fragment = separator and prefix:sub(separator + 1) or prefix
     local query = directory ~= "" and directory or "."
-    local ok, entries = pcall(native.list, query, true)
+    local ok, entries = pcall(function() return native.list(path_arg(query), true) end)
     if not ok or type(entries) ~= "table" then return {} end
     local result = {}
     for _, entry in ipairs(entries) do

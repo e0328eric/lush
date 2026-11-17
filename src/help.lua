@@ -101,13 +101,14 @@ add("ls", "Filesystem", "List files as structured records or display the embedde
              "'-L', '--level', depth: limit recursion depth.", "'-D', '--only-dirs' / '-f', '--only-files': filter file kinds.",
              "'-s', '--sort', field / '-r', '--reverse': choose sorting.", "'-I', '--ignore-glob', patterns: exclude matching names.",
              "'--group-directories-first' / '--group-directories-last': group entries.", "'--git': display Git status.",
+             "'--total-size': sum directory contents. Slow interactive size scans show how many entries have been visited.",
              "'--icons=WHEN', '--color=WHEN': always, auto, or never.", "'--tui': open the interactive browser.",
              "'--lol': play the takeoff animation; '--lol=signal' permits Ctrl+C.", "'--snapshot', '-w', columns: render a browser or animation snapshot.",
              "'--': subsequent strings are paths, including names beginning with '-'."},
     examples = {"ls()", "ls('-la', '.')", "ls():columns()", "ls():first(1)",
                 "ls():where(function(f) return f.type == 'file' end):select('name', 'size')",
                 "ls():get('size')", "ls():foreach(function(f) print(f.size) end)", "ls('--tui')"},
-    notes = "In a callback such as where(function(f) ... end), f is one file record with the fields above. Return true to keep it or false to skip it. print() returns nil; use foreach(function(f) print(f.size) end) for printing, or get('size') to extract sizes. columns() discovers fields present in the current results; first(1) shows a sample record. Untransformed display uses fls formatting. Transforming or collecting yields records. Use show(ls('--help')) for the complete fls flag reference. Paths remain literal; shell wildcard expansion is explicit.",
+    notes = "In a callback such as where(function(f) ... end), f is one file record with the fields above. Return true to keep it or false to skip it. print() returns nil; use foreach(function(f) print(f.size) end) for printing, or get('size') to extract sizes. columns() discovers fields present in the current results; first(1) shows a sample record. Untransformed display uses fls formatting. Transforming or collecting yields records. Use show(ls('--help')) for the complete fls flag reference. A leading ~ path component expands to your home directory. Wildcard expansion is explicit.",
 })
 add("sl", "Display", "Play the embedded fls airplane takeoff animation.", {
     usage = "sl(...flags)", output = "display-only Flow", parameters = {"...flags: optional fls animation/display flags."},
@@ -115,19 +116,19 @@ add("sl", "Display", "Play the embedded fls airplane takeoff animation.", {
     examples = {"sl()", "show(sl('--lol=signal'))", "show(sl('--snapshot', '-w', '80'))"},
     notes = "Equivalent to ls('--lol', ...). Live animation needs an interactive terminal.",
 })
-add("pwd", "Filesystem", "Return the current working directory.", {output = "path string", examples = {"pwd()"}})
+add("pwd", "Filesystem", "Return the current working directory with forward slash separators.", {output = "path string", examples = {"pwd()"}})
 add("cd", "Filesystem", "Change the shell's working directory.", {
-    usage = "cd(path?)", parameters = {"path: directory; omitted uses HOME or USERPROFILE."},
-    examples = {"cd('src')", "cd(path.expand('~'))"},
+    usage = "cd(path?)", parameters = {"path: directory. Omit it or use '~' for %USERPROFILE% on Windows or $HOME on POSIX."},
+    examples = {"cd('src')", "cd('~/work')", "cd()"},
 })
 add("cat", "Filesystem", "Read a file's bytes into a Lua string.", {
-    usage = "cat(path)", output = "byte string", parameters = {"path: literal file path."},
+    usage = "cat(path)", output = "byte string", parameters = {"path: file to read."},
     examples = {"cat('README.md')", "from.json(cat('settings.json'))"},
     notes = "Returns the raw bytes without decoding. Also available as lush.cat(path) and lush.read(path).",
 })
 add("open", "Filesystem", "Open a file, folder, or URL with its Windows default application.", {
     usage = "open(target)", output = "true when Windows accepts the launch request",
-    parameters = {"target: nonempty literal file path, directory path, or URL; NUL bytes are rejected."},
+    parameters = {"target: nonempty file path, directory path, or URL without NUL bytes."},
     examples = {"open('README.md')", "open('.')", "open('https://example.com')"},
     notes = "Windows only. Dispatches one target through its registered association and returns without waiting for the application to exit. Launch failures raise Lua errors. Use cat(path) or lush.read(path) to read file bytes.",
 })
@@ -142,32 +143,33 @@ add("mkdir", "Filesystem", "Create a directory and, by default, its missing pare
     flags = {"{parents = true}: create missing parent directories (default true)."}, examples = {"mkdir('reports/2026')"},
 })
 add("touch", "Filesystem", "Create an absent file or update its modification time without changing contents.", {
-    usage = "touch(path)", output = "true", parameters = {"path: literal file path."}, examples = {"touch('notes.txt')"},
+    usage = "touch(path)", output = "true", parameters = {"path: file to create or update."}, examples = {"touch('notes.txt')"},
 })
 for _, item in ipairs({{"cp", "Copy a file or directory to an exact destination.", "recursive"},
                        {"mv", "Move or rename a file or directory to an exact destination."}}) do
     add(item[1], "Filesystem", item[2], {
         usage = item[1] .. "(source, destination, options?)", output = "true",
-        parameters = {"source: existing literal path.", "destination: exact target path; the source name is not appended.", "options: Lua option table."},
+        parameters = {"source: existing path.", "destination: exact target path; the source name is not appended.", "options: Lua option table."},
         flags = item[3] and {"{recursive = true}: copy a directory tree (default false).", "{overwrite = true}: permit replacing an existing destination (default false)."}
                         or {"{overwrite = true}: permit replacing an existing destination (default false)."},
         examples = {item[1] .. "('draft.txt', 'final.txt')"},
-        notes = item[3] and "Recursive copies preserve symbolic links. Existing tree merging requires overwrite = true."
+        notes = item[3] and "Longer copies show the percentage of bytes copied across the file or directory tree. Recursive copies preserve symbolic links. Existing tree merging requires overwrite = true."
                        or "Uses native rename semantics; cross-device and directory replacement limits depend on the platform.",
     })
 end
 add("rm", "Filesystem", "Remove a file or directory with explicit recursive and missing-path options.", {
-    usage = "rm(path, options?)", output = "true", parameters = {"path: literal path to remove.", "options: Lua option table."},
+    usage = "rm(path, options?)", output = "true", parameters = {"path: path to remove.", "options: Lua option table."},
     flags = {"{recursive = true}: remove a directory tree (default false).", "{force = true}: ignore an absent path (default false)."},
     examples = {"rm('temporary.txt')", "rm('cache', {recursive = true})"},
+    notes = "Longer recursive deletions show the number of entries removed on terminal stderr.",
 })
 add("stat", "Filesystem", "Return metadata for a path.", {
     usage = "stat(path, follow?)", output = "record with path, name, type, size, and available modification time",
-    parameters = {"path: literal path.", "follow: follow the final symbolic link; defaults to true."},
+    parameters = {"path: entry to inspect.", "follow: follow the final symbolic link; defaults to true."},
     examples = {"stat('README.md')", "stat('link', false)"},
 })
 add("exists", "Filesystem", "Test whether a directory entry exists, including a dangling symbolic link.", {
-    usage = "exists(path)", output = "boolean", parameters = {"path: literal path."}, examples = {"exists('README.md')"},
+    usage = "exists(path)", output = "boolean", parameters = {"path: entry to check."}, examples = {"exists('README.md')"},
 })
 add("lush.write", "Filesystem", "Write bytes directly to a file.", {
     usage = "lush.write(path, bytes, append?)", output = "true", parameters = {"path: destination.", "bytes: Lua byte string.", "append: optional boolean."},

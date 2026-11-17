@@ -96,11 +96,12 @@ def check(executable):
               "submitted command did not return to the prompt")
         settle()
 
-    def edit(data, cursor, line=None):
+    def edit(data, cursor, line=None, prefix=PROMPT, row=None):
         before = len(transcript.raw)
         terminal.send(data)
         until(lambda: len(transcript.raw) > before and transcript.visible and transcript.x == cursor and
-              (line is None or transcript.current_line() == (PROMPT + line).rstrip()),
+              (row is None or transcript.y == row) and
+              (line is None or transcript.current_line() == (prefix + line).rstrip()),
               "prompt did not finish the expected edit")
         settle()
 
@@ -197,6 +198,27 @@ def check(executable):
         until(lambda: transcript.current_line() == PROMPT.rstrip() and transcript.x == len(PROMPT),
               "cancel did not return to an empty prompt")
         settle()
+        # An empty continuation can be undone immediately. A second Enter can
+        # add another blank line, and each Backspace must remove just one.
+        primary_row = transcript.y
+        continuation = "... "
+        source = "print(#'é'+40+"
+        edit(source.encode() + b"\r", len(continuation), "", continuation, primary_row + 1)
+        edit(b"\x7f", len(PROMPT + source), source, row=primary_row)
+        assert not "".join(transcript.cells[primary_row + 1]).strip(), "stale continuation prompt"
+
+        edit(b"\r\r", len(continuation), "", continuation, primary_row + 2)
+        edit(b"2)\x01", len(continuation), "2)", continuation, primary_row + 2)
+        edit(b"\x7f", len(continuation), "2)", continuation, primary_row + 1)
+        edit(b"\x7f", len(PROMPT + source), source + "2)", row=primary_row)
+        assert all(not "".join(cells).strip() for cells in
+                   transcript.cells[primary_row + 1:primary_row + 3]), "stale continuation rows"
+        # The caret is at the join, so insertion changes the executed result.
+        edit(b"1+", len(PROMPT + source + "1+"), source + "1+2)")
+        submit("")
+        assert "".join(transcript.cells[primary_row + 1]).strip() == "45", "wrong joined command result"
+        edit(b"\x1b[A", len(PROMPT + source + "1+2)"), source + "1+2)")
+        edit(b"\x1b[B", len(PROMPT), "")
         terminal.send(b"exit(0)\r")
         until(lambda: terminal.poll() is not None, "REPL did not exit")
         assert terminal.poll() == 0
@@ -213,7 +235,7 @@ def main():
         print("SKIP: Windows ConPTY prompt transcript")
         return
     check(args.exe.resolve(strict=True))
-    print("REPL cursor checks passed: atomic history/edit redraws, silent unchanged keys, Unicode, Ctrl+L and Tab")
+    print("REPL cursor checks passed: redraws, unchanged keys, Unicode, Ctrl+L, Tab and continuation Backspace")
 
 
 if __name__ == "__main__":

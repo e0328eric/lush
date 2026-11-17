@@ -1,0 +1,53 @@
+//! Recursive apparent sizes used by displayed listings and structured records.
+#import "File_System/Directory";
+#import "File_System/Metadata";
+#import "File_System/Types";
+#import "util.glo";
+Progress :: #import "../../../src/progress_display.glo";
+
+#public Size_Scan :: struct {
+    bar: Progress.Terminal_Bar;
+    entries: s64;
+}
+
+Size_Scan ::: #public {
+    start :: (interactive_output: bool) -> Size_Scan {
+        scan: Size_Scan;
+        if interactive_output scan.bar = Progress.Terminal_Bar.start();
+        return scan;
+    }
+
+    clear :: (*#self) {
+        if #self.bar.interactive Progress.clear(&#self.bar);
+    }
+
+    visit :: (*#self) {
+        if !#self.bar.interactive return;
+        #self.entries += 1;
+        Progress.scanning(cast(*void) &#self.bar, #self.entries);
+    }
+
+    /// A directory that cannot be enumerated has no size. Its parent can
+    /// still report the sizes of its readable children.
+    measure :: (*#self, path: str, depth: s64 = 0) -> ?s64 {
+        if depth == 0 #self.visit();
+        if depth > 64 return ?0;
+        #pattern .Ok(cursor) := Directory.open_directory(path) else { return null; };
+        total: s64;
+        while true {
+            #pattern .Ok(next) := cursor.next() else {
+                _ := cursor.close();
+                return null;
+            };
+            #pattern ?entry := next else { break; };
+            #self.visit();
+            child := join_path(path, entry.name);
+            defer child.free();
+            #pattern .Ok(info) := metadata(child, false) else { continue; };
+            if info.kind == .Directory total += #self.measure(child, depth + 1).unwrap_or(0);
+            else total += info.size;
+        }
+        if cursor.close().is_err() return null;
+        return ?total;
+    }
+}

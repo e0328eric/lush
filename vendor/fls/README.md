@@ -9,6 +9,8 @@ or a sibling checkout is not required. The command-line listing, long/grid/tree
 renderers, colors, Nerd Font icons, Git status, browser, and airplane animation
 come from these sources. `src/fls.glo` in Lush adapts their entry points and
 exposes file records using the same option parser, filters, and sorting.
+The renderer and record adapter share Lush's `directory_size.glo` walker,
+which counts entries during interactive `--total-size` scans.
 
 The snapshot has adaptations for a persistent shell process:
 
@@ -22,10 +24,13 @@ The snapshot has adaptations for a persistent shell process:
   only when canonicalization fails.
 - `util.glo`: expose cleanup for identity/group/timezone caches and refresh
   cached time between invocations; allocate fallback identity text only when
-  lookup fails.
+  lookup fails; use native Windows path helpers so canonical paths retain
+  valid separators when joining entries or navigating to parent directories.
 - `tui.glo`: query owned environment values through a helper that allocates
   fallback text only on failure; hide the cursor before painting and position
-  the input caret before showing it, following rne's terminal loop.
+  the input caret before showing it, following rne's terminal loop; use the
+  native `lush.open` handler for the default file opener on Windows. Longer
+  copies and deletions display progress in the browser's status row.
 - `lol.glo`: keep the cursor hidden throughout each animation frame and restore
   it on exit. Both interactive views use Lush's `src/screen.glo` helper, which
   mirrors cursor visibility to ConPTY hosts in the VT output stream.

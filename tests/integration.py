@@ -147,6 +147,8 @@ def check_filesystem(suite):
     (root / 'folder').mkdir()
     suite.check(
         f'local original = pwd(); cd({lua_string(root)}); '
+        f'assert(pwd() == {lua_string(root.as_posix())}); '
+        'assert(pwd() == lush.pwd() and select("#", pwd()) == 1); '
         'assert(pwd() ~= original); cd(original); assert(pwd() == original); print("cwd ok")',
         'cwd ok\n',
     )

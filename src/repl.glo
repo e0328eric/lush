@@ -18,7 +18,7 @@ Layout :: #import "repl_layout.glo";
 #import "Format";
 #import "Memory/Ownership";
 
-Edited_Line :: struct {
+Submission :: struct {
     text: str;
     error: str;
     eof: bool;
@@ -28,7 +28,7 @@ Edited_Line :: struct {
 
 Input_Style :: struct {
     state: *void;
-    pending: str; // Borrowed, unchanged for this editor invocation.
+    pending: str; // Borrowed prefix before the active line.
     enabled: bool;
     initialized: bool;
     text: str;
@@ -217,11 +217,12 @@ suggestion :: (input: *Terminal_Text_Input, history: []const str, enabled: bool)
 }
 
 redraw :: (session: *Terminal_Session, input: *Terminal_Text_Input, prompt: *Runtime.Prompt,
-    style: *Input_Style, footprint: *Layout.Footprint, candidate: str = "", geometry_only: bool = false) {
+    style: *Input_Style, footprint: *Layout.Footprint, candidate: str = "", geometry_only: bool = false,
+    rewind_rows: ssize = 0) -> bool {
     geometry := Layout.query(session);
     wanted_headers := prompt_header_count(session, prompt);
     repair := Layout.changed(footprint, geometry, wanted_headers);
-    if geometry_only && !repair return;
+    if geometry_only && !repair return false;
     columns := geometry.columns;
     if columns <= 0 columns = 80;
     headers := ifx repair wanted_headers else 0;
@@ -275,6 +276,7 @@ redraw :: (session: *Terminal_Session, input: *Terminal_Text_Input, prompt: *Run
     frame: String_Builder;
     defer frame.free();
     frame.write_string("\x1b[?25l\r\x1b[0m");
+    if rewind_rows > 0 frame.writef("\x1b[K\x1b[{}A", rewind_rows);
     if repair && footprint.valid Layout.recover(session, footprint, geometry, &frame);
     for i: 0..headers {
         Layout.reset_row(&footprint.header[i]);
@@ -322,9 +324,9 @@ redraw :: (session: *Terminal_Session, input: *Terminal_Text_Input, prompt: *Run
     if prompt_cells + cursor_cells > 0
         frame.writef("\x1b[{}C", prompt_cells + cursor_cells);
     frame.write_string("\x1b[?25h");
-    if session.cursor_show(false).is_err() return;
+    if session.cursor_show(false).is_err() return false;
     // Leave cursor_hidden set on a failed write so session.end restores it.
-    if session.write(frame.to_string()).is_err() return;
+    if session.write(frame.to_string()).is_err() return false;
     footprint.input.widths.free();
     footprint.input = value_take(&next_input);
     footprint.columns = geometry.columns;
@@ -335,6 +337,7 @@ redraw :: (session: *Terminal_Session, input: *Terminal_Text_Input, prompt: *Run
     footprint.valid = true;
     _ := session.cursor_show(true);
     _ := session.flush();
+    return repair;
 }
 
 // Complete the source before the caret. The Lua hook returns complete prefix
@@ -433,8 +436,28 @@ complete :: (state: *void, input: *Terminal_Text_Input, session: *Terminal_Sessi
     return true;
 }
 
-read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, autosuggestions: bool,
-    syntax_highlighting: bool, pending: str) -> Edited_Line {
+// One entry per Enter, including blank lines. Pasted newlines stay in the
+// same editor row. source_start is the byte length before appending the row.
+Submitted_Row :: struct { source_start: ssize; headers: ssize; }
+
+append_line :: (state: *void, source: *String_Builder, line: str) -> bool {
+    if source.len() == 0 && line.trim().count == 0 return false;
+    if source.len() > 0 source.write_string("\n");
+    source.write_string(line);
+    checked := Runtime.check(state, source.to_string(), "=stdin");
+    defer checked.message.free();
+    return checked.incomplete;
+}
+
+end_of_input :: (state: *void, source: *String_Builder) -> Submission {
+    if source.len() == 0 return .{ .eof = true };
+    checked := Runtime.check(state, source.to_string(), "=stdin");
+    if checked.message.count > 0 return .{ .error = checked.message };
+    return .{ .error = "unexpected end of input in incomplete Lua chunk".clone() };
+}
+
+read_edited :: (state: *void, primary: *Runtime.Prompt, history: []const str, suggest_history: bool,
+    syntax_highlighting: bool) -> Submission {
     session: Terminal_Session;
     if Terminal_Session.terminal_begin(.Raw | .Bracketed_Paste) == {
     case .Ok(value); session = value;
@@ -445,7 +468,17 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
     input: Terminal_Text_Input;
     input.limit = 1_048_576;
     defer input.free();
-    style := Input_Style.{ .state = state, .pending = pending,
+    source: String_Builder;
+    defer source.free();
+    submitted: [..]Submitted_Row;
+    defer submitted.free();
+    // Rows preceding a screen clear, completion listing, or reflow can still
+    // be edited, but their old screen positions can no longer be reused.
+    detached: ssize;
+    continuation := Runtime.Prompt.{ .input = "... " };
+    prompt := primary;
+    autosuggestions := suggest_history;
+    style := Input_Style.{ .state = state,
         .enabled = syntax_highlighting && session.capabilities.color != .None };
     defer style.text.free();
     defer style.mask.free();
@@ -461,7 +494,7 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
             if event.kind == .None {
                 if session.input_closed {
                     _ := session.write("\r\n");
-                    return .{ .eof = true };
+                    return end_of_input(state, &source);
                 }
                 continue;
             }
@@ -469,18 +502,17 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
                 input.paste_cr = false;
                 continue;
             }
-            if event.kind == .Resize {
-                redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions), true);
-                continue;
-            }
-            if event.kind != .Key continue;
+            if event.kind != .Resize && event.kind != .Key continue;
             // Resize records can sit behind already queued keys. Repair the
             // previous paint before Tab output, submission, or editing uses it.
-            redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions), true);
+            if redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions), true)
+                detached = submitted.count;
+            if event.kind == .Resize continue;
             key := event.key;
             if !key.pasted && key.code == .Character && key.ctrl {
                 if key.rune == 108 {
                     _ := session.clear();
+                    detached = submitted.count;
                     footprint.valid = false;
                     redraw(&session, &input, prompt, &style, &footprint, suggestion(&input, history, autosuggestions));
                     continue;
@@ -494,7 +526,7 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
                 if key.rune == 100 {
                     if input.values.count == 0 {
                         _ := session.write("\r\n");
-                        return .{ .eof = true };
+                        return end_of_input(state, &source);
                     }
                     previous_count := input.values.count;
                     input.erase(input.cursor, input.next(input.cursor));
@@ -503,13 +535,45 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
                     continue;
                 }
             }
-            if !key.pasted && key.code == .Enter && !key.alt && !key.shift {
-                if input.cursor != input.values.count || suggestion(&input, history, autosuggestions).count > 0 {
+            submit := !key.pasted && key.code == .Enter && !key.alt && !key.shift;
+            join := !key.pasted && key.code == .Backspace && input.cursor == 0 && submitted.count > 0;
+            if submit || join {
+                rewind: ssize;
+                if submit {
+                    if input.cursor != input.values.count || suggestion(&input, history, autosuggestions).count > 0 {
+                        input.cursor = input.values.count;
+                        redraw(&session, &input, prompt, &style, &footprint);
+                    }
+                    _ := session.write("\r\n");
+                    row := Submitted_Row.{ .source_start = source.len(), .headers = footprint.headers };
+                    if !append_line(state, &source, input.text()) return .{ .text = source.clone_string() };
+                    submitted.push(row);
+                    input.clear();
+                } else {
+                    row := submitted.pop();
+                    if submitted.count >= detached rewind = 1 + row.headers;
+                    else detached = submitted.count;
+                    start := row.source_start;
+                    if start > 0 start += 1; // Skip the separator before the restored row.
+                    // Both halves already passed text input validation. Restore
+                    // them in full, even if joining exceeds the insertion limit.
+                    suffix := input.values.take();
+                    defer suffix.free();
+                    for value: source.to_string()[start..] input.values.push(cast(u32) value);
                     input.cursor = input.values.count;
-                    redraw(&session, &input, prompt, &style, &footprint);
+                    input.values.extend(suffix.view());
+                    input.paste_cr = false;
+                    source.truncate(row.source_start);
                 }
-                _ := session.write("\r\n");
-                return .{ .text = input.text().clone() };
+                style.pending = source.to_string();
+                style.initialized = false;
+                prompt = ifx submitted.count == 0 primary else &continuation;
+                autosuggestions = suggest_history && submitted.count == 0;
+                history_at = history.count;
+                footprint.valid = false;
+                redraw(&session, &input, prompt, &style, &footprint,
+                    suggestion(&input, history, autosuggestions), false, rewind);
+                continue;
             }
             changed := false;
             if !key.pasted && key.code == .Right && !key.ctrl && !key.alt && !key.shift &&
@@ -540,6 +604,7 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
                     // The grid moved the edit line. Its prompt headers must
                     // move with it before a resize can repaint relative rows.
                     footprint.valid = false;
+                    detached = submitted.count;
                 }
             } else {
                 previous_count := input.values.count;
@@ -552,7 +617,7 @@ read_edited :: (state: *void, prompt: *Runtime.Prompt, history: []const str, aut
     }
 }
 
-read_canonical :: (prompt: *Runtime.Prompt, show_prompt: bool) -> Edited_Line {
+read_canonical_line :: (prompt: *Runtime.Prompt, show_prompt: bool) -> Submission {
     if show_prompt {
         for line: prompt.lines {
             text := plain_prompt(line.left, 78);
@@ -571,6 +636,22 @@ read_canonical :: (prompt: *Runtime.Prompt, show_prompt: bool) -> Edited_Line {
         if !line.has_input return .{ .eof = true };
         if line.truncated return .{ .error = "input line exceeds 1 MiB".clone() };
         return .{ .text = line.text.clone() };
+    }
+}
+
+read_canonical :: (state: *void, prompt: *Runtime.Prompt, show_prompt: bool) -> Submission {
+    source: String_Builder;
+    defer source.free();
+    continuation := Runtime.Prompt.{ .input = "... " };
+    while true {
+        #temp_scope {
+            line := read_canonical_line(prompt, show_prompt);
+            if line.error.count > 0 return line;
+            if line.eof return end_of_input(state, &source);
+            defer line.text.free();
+            if !append_line(state, &source, line.text) return .{ .text = source.clone_string() };
+            prompt = &continuation;
+        }
     }
 }
 
@@ -615,28 +696,21 @@ run :: (state: *void, startup_directory: str, default_history: str) -> s32 {
             persistence_warned = true;
         }
     }
-    pending: String_Builder;
-    defer pending.free();
-    pending_error: str;
-    defer pending_error.free();
-    empty: str;
     last_code := Runtime.last_status(state);
     edited := true;
 
     while !Native.requested_exit {
         #temp_scope {
             prompt: Runtime.Prompt;
-            if pending.buf.count != 0 prompt.input = "... ".clone();
-            else if show_prompt prompt = Runtime.prompt(state);
+            if show_prompt prompt = Runtime.prompt(state);
             defer Runtime.release_prompt(&prompt);
-            line: Edited_Line;
+            line: Submission;
             if edited {
                 line = read_edited(state, &prompt, history.view(),
-                    settings.autosuggestions && pending.buf.count == 0,
-                    settings.syntax_highlighting, pending.to_string());
+                    settings.autosuggestions, settings.syntax_highlighting);
                 if line.unavailable edited = false;
             }
-            if !edited line = read_canonical(&prompt, show_prompt);
+            if !edited line = read_canonical(state, &prompt, show_prompt);
             defer line.text.free();
             defer line.error.free();
             if line.error.count > 0 {
@@ -644,32 +718,12 @@ run :: (state: *void, startup_directory: str, default_history: str) -> s32 {
                 return 1;
             }
             if line.cancelled {
-                pending.clear();
-                pending_error.free();
-                pending_error = empty;
                 last_code = 130;
                 continue;
             }
-            if line.eof {
-                if pending.buf.count != 0 {
-                    if pending_error.count > 0 write_error(pending_error);
-                    else write_error("unexpected end of input in incomplete Lua chunk");
-                    return 1;
-                }
-                return last_code;
-            }
-            if pending.buf.count == 0 && line.text.trim().count == 0 continue;
-            if pending.buf.count != 0 pending.write_string("\n");
-            pending.write_string(line.text);
-            checked := Runtime.check(state, pending.to_string(), "=stdin");
-            defer checked.message.free();
-            pending_error.free();
-            pending_error = empty;
-            if checked.incomplete {
-                pending_error = checked.message.clone();
-                continue;
-            }
-            text := pending.to_string();
+            if line.eof return last_code;
+            text := line.text;
+            if text.trim().count == 0 continue;
             if settings.limit > 0 && (history.count == 0 || history[history.count - 1] != text) {
                 if history.count >= settings.limit {
                     history[0].free();
@@ -689,7 +743,6 @@ run :: (state: *void, startup_directory: str, default_history: str) -> s32 {
             // Save before executing, including commands that call os.exit().
             evaluated := Runtime.evaluate(state, text, "=stdin", true);
             defer evaluated.message.free();
-            pending.clear();
             if evaluated.ok last_code = Runtime.last_status(state);
             else {
                 write_error(evaluated.message);

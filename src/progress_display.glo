@@ -1,0 +1,169 @@
+//! Delayed, single-row progress for the shell and file browser.
+Fmt :: #import "Format";
+Util :: #import "../vendor/fls/src/util.glo";
+#import "File_System/File";
+#import "Io";
+#import "Io/Terminal";
+#import "String_Builder";
+#import "Time";
+#import "Context";
+
+#public {
+Timing :: struct {
+    last_ns: s64;
+    visible: bool;
+}
+}
+
+Timing ::: #public {
+    start :: () -> Timing {
+        return .{ .last_ns = Clock.Monotonic.now().unwrap_or(.{}).nanoseconds };
+    }
+
+    ready :: (*#self) -> bool {
+        #pattern .Ok(now) := Clock.Monotonic.now() else { return false; };
+        delay := ifx #self.visible 80_000_000 else 250_000_000;
+        if now.nanoseconds - #self.last_ns < delay return false;
+        #self.last_ns = now.nanoseconds;
+        #self.visible = true;
+        return true;
+    }
+}
+
+copy_bytes :: (bytes: s64) -> str {
+    amount, unit := Util.human_size(bytes, .Binary);
+    return Fmt.tprint("{} {}B", amount, unit);
+}
+
+with_entry_count :: (label: str, entries: s64, columns: ssize) -> str {
+    if entries < 0 return label;
+    unit := ifx entries == 1 "entry" else "entries";
+    combined := Fmt.tprint("{}  {} {}", label, Util.group_digits(entries), unit);
+    if combined.count <= columns return combined;
+    return label;
+}
+
+#public {
+copy_label :: (done: s64, total: s64, complete: bool, columns: ssize, entries: s64 = -1) -> str {
+    if !complete && total == -1 return entries_label("Scanning", done, columns);
+    if !complete && total == -3 return entries_label("Copied", done, columns);
+    if !complete && total < 0 {
+        amount := copy_bytes(done);
+        label := Fmt.tprint("Copying {}", amount);
+        if label.count <= columns return with_entry_count(label, entries, columns);
+        if amount.count <= columns return amount;
+        return "";
+    }
+
+    percent: s64;
+    if complete percent = 100;
+    else if total > 0 {
+        // Reserve 100% until the native copy has closed the file and applied metadata.
+        if done >= total percent = 99;
+        else percent = cast(s64) (cast(s128) done * 100 / cast(s128) total);
+    }
+    label := Fmt.tprint("{}%", percent);
+    if !complete && done > 0 && percent == 0 label = "<1%";
+    if columns < label.count return "";
+    if columns < 12 return label;
+    if !complete && total > 0 {
+        transferred := Fmt.tprint("{}  {}", label, copy_bytes(done));
+        amounts := Fmt.tprint("{} / {}", transferred, copy_bytes(total));
+        if 8 + amounts.count <= columns label = amounts;
+        else if 8 + transferred.count <= columns label = transferred;
+        label = with_entry_count(label, entries, columns - 8);
+    }
+    filled := "########################";
+    empty := "------------------------";
+    width := columns - 11 - label.count; // "Copying [" + "] " + label
+    if width < 3 return Fmt.tprint("Copying {}", label);
+    if width > filled.count width = filled.count;
+    cells := width * cast(ssize) percent / 100;
+    return Fmt.tprint("Copying [{}{}] {}", filled[..cells], empty[..(width - cells)], label);
+}
+
+entries_label :: (verb: str, entries: s64, columns: ssize) -> str {
+    count := Util.group_digits(entries);
+    unit := ifx entries == 1 "entry" else "entries";
+    label := Fmt.tprint("{} {} {}", verb, count, unit);
+    if label.count <= columns return label;
+    short := Fmt.tprint("{} {}", verb, count);
+    if short.count <= columns return short;
+    if count.count <= columns return count;
+    return "";
+}
+
+Terminal_Bar :: struct {
+    stream: File;
+    columns: ssize;
+    painted: ssize;
+    interactive: bool;
+    timing: Timing;
+}
+}
+
+Terminal_Bar ::: #public {
+    start :: () -> Terminal_Bar {
+        bar := Terminal_Bar.{ .stream = File.stderr() };
+        caps := Terminal_Query(File).capabilities(&bar.stream).unwrap_or(.{});
+        bar.interactive = caps.interactive;
+        bar.columns = ifx caps.columns > 0 caps.columns - 1 else 79;
+        if bar.interactive bar.timing = Timing.start();
+        return bar;
+    }
+}
+
+// Carriage returns also work on terminals without ANSI cursor controls.
+paint :: (bar: *Terminal_Bar, line: str, completed: bool = false) {
+    frame: String_Builder;
+    defer frame.free();
+    frame.write_string("\r");
+    frame.write_string(line);
+    if bar.painted > line.count frame.write_repeated_byte(32, bar.painted - line.count);
+    if completed frame.write_string("\r\n");
+    else if line.count == 0 frame.write_string("\r");
+    _ := bar.stream.write(frame.to_string());
+    bar.painted = line.count;
+}
+
+show_count :: (state: *void, verb: str, count: s64) {
+    bar := cast(*Terminal_Bar) state;
+    if !bar.interactive || !bar.timing.ready() return;
+    #temp_scope {
+        paint(bar, entries_label(verb, count, bar.columns));
+    }
+}
+
+#public {
+update :: (state: *void, done: s64, total: s64, entries: s64) {
+    bar := cast(*Terminal_Bar) state;
+    if !bar.interactive || !bar.timing.ready() return;
+    #temp_scope {
+        paint(bar, copy_label(done, total, false, bar.columns, entries));
+    }
+}
+
+deleted :: (state: *void, count: s64) {
+    show_count(state, "Deleted", count);
+}
+
+scanning :: (state: *void, count: s64) {
+    show_count(state, "Scanning", count);
+}
+
+clear :: (bar: *Terminal_Bar) {
+    if bar.painted > 0 paint(bar, "");
+}
+
+finish_copy :: (bar: *Terminal_Bar, success: bool) {
+    if bar.painted == 0 return;
+    if success paint(bar, copy_label(0, 0, true, bar.columns), true);
+    else clear(bar);
+}
+
+finish_delete :: (bar: *Terminal_Bar, count: s64, success: bool) {
+    if bar.painted == 0 return;
+    if success paint(bar, entries_label("Deleted", count, bar.columns), true);
+    else clear(bar);
+}
+}

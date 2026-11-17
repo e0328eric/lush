@@ -1,0 +1,142 @@
+//! Count completed removals in the same traversal that deletes the tree.
+#import "File_System/Directory";
+#import "File_System/Metadata";
+#import "File_System/Path";
+#import "File_System/Sandbox";
+#import "File_System/Types";
+#import "Memory/Ownership";
+#import "Context";
+#import "Format";
+#import "Strings/Utf8";
+
+#public Progress :: #fn_ptr(state: *void, count: s64);
+
+Pending :: struct {
+    relative: str;
+    expanded: bool;
+}
+
+Pending ::: instance Freeable {
+    free :: (item: *Pending) {
+        defer free_fields(item);
+        item.relative.free();
+    }
+}
+
+// Snapshot a directory before deleting any of its entries. Some native
+// directory cursors skip names when a live listing is modified.
+push_children :: (root: *Sandbox, relative: str, pending: *[..]Pending) -> Fs_Error!void {
+    directory := root.open_directory(relative)?;
+    defer directory.free();
+    start := pending.*.count;
+    while true {
+        next := directory.next()?;
+        #pattern ?entry := next else { break; };
+        child := ifx relative == "." entry.name.clone() else path_join(relative, entry.name);
+        pending.push(.{ .relative = child });
+    }
+    pending.*[start..].reverse();
+    return directory.close();
+}
+
+Step :: enum { Listed; Skipped; Removed; }
+
+remove_entry :: (root: *Sandbox, pending: *[..]Pending) -> Fs_Error!Step {
+    top := pending.*.count - 1;
+    relative := pending.*[top].relative;
+    if !pending.*[top].expanded {
+        directory := relative == ".";
+        if !directory {
+            if root.metadata(relative) == {
+            case .Ok(info); directory = info.kind == .Directory;
+            case .Err(error);
+                // The object may have disappeared since it was listed.
+                if error.kind == .Not_Found return .Ok(.Skipped);
+                // Windows refuses to stat a final reparse point. Removing it
+                // by handle still acts only on the entry beneath the root.
+                if error.kind != .Too_Many_Links return .Err(error);
+            }
+        }
+        if directory {
+            pending.*[top].expanded = true;
+            _ := push_children(root, relative, pending)?;
+            return .Ok(.Listed);
+        }
+    }
+    if relative == "." return .Ok(.Skipped);
+    kind := ifx pending.*[top].expanded Sandbox_Remove_Kind.Directory else Sandbox_Remove_Kind.Any;
+    _ := root.remove(relative, kind)?;
+    return .Ok(.Removed);
+}
+
+remove_contents :: (root: *Sandbox, target: str, notify: Progress, state: *void) -> Fs_Error!ssize {
+    pending: [..]Pending;
+    defer pending.free();
+    pending.push(.{ .relative = ".".clone() });
+    count: ssize;
+    while pending.count > 0 {
+        top := pending.count - 1;
+        relative := pending[top].relative;
+        mark := temp_mark();
+        result := remove_entry(root, &pending);
+        temp_rewind(mark);
+        if result == {
+        case .Err(error);
+            full := target;
+            if relative != "." {
+                #if OUT.os == .Windows full = path_join(target, relative, .allocator = context.temp_allocator);
+                else full = tprint("{}/{}", target, relative);
+            }
+            error.completed += count;
+            return .Err(error.with_path(full));
+        case .Ok(step);
+            if step == .Listed continue;
+            if step == .Removed {
+                count += 1;
+                notify(state, count);
+            }
+        }
+        item := array_pop_last(&pending);
+        item.free();
+    }
+    return .Ok(count);
+}
+
+#public remove_tree :: (path: str, notify: ?Progress, state: *void) -> Fs_Error!ssize {
+    #pattern ?update := notify else { return remove_all(path); };
+    update(state, 0);
+    // A trailing separator must never turn a final directory symlink into
+    // a tree to descend into. Delegate single entries and invalid spellings
+    // to remove_all, which handles these cases without a traversal.
+    root_name := path_parse_root(path);
+    end := path.count;
+    while end > root_name.rest_start && path_is_separator(path[end - 1], .Native, root_name.verbatim)
+        end -= 1;
+    target := path[..end];
+    name := path_basename(target);
+    if name == "." || name == ".." || path.has_nul() return remove_all(path);
+    #pattern .Ok(info) := metadata(target, false) else { return remove_all(path); };
+    if info.kind != .Directory {
+        count := remove_all(path)?;
+        update(state, count);
+        return .Ok(count);
+    }
+    count: ssize;
+    {
+        root := Sandbox.open_sandbox(target)?;
+        defer root.free();
+        opened := root.metadata(".")?;
+        before := info.file_id;
+        after := opened.file_id;
+        if before.valid && after.valid && (before.high != after.high || before.low != after.low ||
+            before.file_high != after.file_high)
+            return .Err(Fs_Error.make_error(.Not_Found, .Open_Directory, 0, target));
+        count = remove_contents(&root, target, update, state)?;
+    }
+    if #pattern .Err(error) = remove(target) {
+        error.completed += count;
+        return .Err(error);
+    }
+    update(state, count + 1);
+    return .Ok(count + 1);
+}

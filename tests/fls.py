@@ -99,8 +99,16 @@ def main() -> None:
                 ["-l", "-b", "-g", "-h", "-H", "-i", "-S", "-n", "-o", "--time-style=full-iso"],
                 ["--absolute", "-d", "sub"], ["-R", "-L2"], ["-d", "sub", "file2.txt"],
                 ["--help"], ["--version"], ["--not-a-real-option"], ["missing-file"],
-                ["--snapshot", "-w", "80"], ["--lol", "--snapshot", "-w", "80"], ["--lol"],
+                ["--lol", "--snapshot", "-w", "80"], ["--lol"],
             ]
+            if os.name == "nt":
+                # The upstream browser joins verbatim Windows paths with '/',
+                # losing entry metadata. Lush fixes that, so its snapshot has
+                # real directory types and groups directories first.
+                browser = run(ls_call(["--snapshot", "-w", "80"])).stdout
+                assert b"sub/" in browser and browser.index(b"sub/") < browser.index(b"file2.txt"), browser
+            else:
+                option_sets.append(["--snapshot", "-w", "80"])
             for options in option_sets:
                 expected = upstream(options)
                 actual = run(ls_call(options), expected.returncode)

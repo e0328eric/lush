@@ -1,0 +1,388 @@
+//! Windows directory copy. One traversal creates directories and feeds a
+//! bounded set of workers. New regular files use exclusive native copies.
+//! The standard file copier handles links and checks aliases on overwrite.
+//! Directory attributes are restored after all writes.
+#import "File_System/Copy";
+#import "File_System/Directory";
+#import "File_System/Metadata";
+#import "File_System/Path";
+#import "File_System/System";
+#import "File_System/Types";
+#import "Memory/Ownership";
+#import "Meta/Utilities";
+#import "Os";
+#import "Strings/Utf8";
+#import "Thread";
+#import "Context";
+Case_Directory :: #import "windows_copy_case.glo";
+
+Paths :: struct { source: str; destination: str; regular: bool; }
+Paths ::: instance Send {}
+Paths ::: instance Freeable {
+    free :: (paths: *Paths) {
+        defer free_fields(paths);
+        paths.source.free();
+        paths.destination.free();
+    }
+}
+
+Listing :: struct {
+    cursor: Directory;
+    // On a case-insensitive target, this is the exact source snapshot
+    // already validated for representable names.
+    checked: ?Directory_List;
+    index: ssize;
+}
+
+Listing ::: #private {
+    next :: (*#self) -> Fs_Error!?Directory_Entry {
+        if #pattern ?entries = #self.checked {
+            if #self.index == entries.entries.count return .Ok(null);
+            #self.index += 1;
+            return .Ok(?entries.entries[#self.index - 1]);
+        }
+        return #self.cursor.next();
+    }
+    close :: (*#self) -> Fs_Error!void {
+        if #pattern ?entries = value_take(&#self.checked) entries.free();
+        else if #self.cursor.valid _ := #self.cursor.close()?;
+        return .Ok;
+    }
+}
+
+Folder :: struct { paths: Paths; listing: Listing; info: Metadata; }
+Restore :: struct { paths: Paths; info: Metadata; }
+
+Job :: struct {
+    policy: Copy_Policy;
+    observer: Copy_Observer;
+    confirmed_bytes: ?*Atomic(s64);
+    work: ?Channel(Paths);
+    completed: ssize;
+    notifications: Mutex(bool);
+    failed: Atomic(bool);
+    error: Fs_Error;
+}
+
+credit :: (job: *Job, paths: Paths, bytes: s64) {
+    if bytes > 0 {
+        if #pattern ?counter = job.confirmed_bytes _ := counter.fetch_add(bytes);
+    }
+    // A caller may use a plain cumulative count, even with several workers.
+    #pattern .Ok(lock) := job.notifications.lock() else { return; };
+    defer lock.unlock();
+    job.completed += 1;
+    if #pattern ?notify = job.observer.progress
+        notify(job.observer.state, paths.source, paths.destination, job.completed);
+}
+
+fail :: (job: *Job, error: Fs_Error, paths: Paths) {
+    _, first := job.failed.compare_exchange(false, true);
+    if !first return;
+    job.error = error;
+    if job.observer.child_errors {
+        source := paths.source;
+        destination := paths.destination;
+        if error.path.count != 0 && error.other_path.count != 0 {
+            source = error.path;
+            destination = error.other_path;
+        }
+        job.error.path = source.clone(heap_allocator());
+        job.error.other_path = destination.clone(heap_allocator());
+    }
+    if #pattern ?queue = job.work queue.close();
+}
+
+#if OUT.os == .Windows && size_of(usize) == 8 {
+    kernel :: #library "kernel32";
+    Transfer :: #fn_ptr(total: s64, transferred: s64, stream_size: s64, stream_transferred: s64,
+        stream_number: u32, reason: u32, source: ssize, destination: ssize, data: *void) -> u32 #c_call;
+    copy_ex :: (source: [*]const u16, destination: [*]const u16, callback: ?Transfer, data: *void,
+        cancelled: ?*s32, flags: u32) -> s32 #foreign kernel "CopyFileExW";
+    last_error :: () -> u32 #foreign kernel "GetLastError";
+    get_file_time :: (handle: ssize, creation: ?*u64, access: ?*u64, modified: ?*u64) -> s32
+        #foreign kernel "GetFileTime";
+    set_file_time :: (handle: ssize, creation: ?*u64, access: ?*u64, modified: ?*u64) -> s32
+        #foreign kernel "SetFileTime";
+
+    Transfer_State :: struct { bytes: ?*Atomic(s64); last: s64; access_restored: bool; }
+    transferred :: (total: s64, done: s64, stream_size: s64, stream_done: s64, stream_number: u32,
+        reason: u32, source: ssize, destination: ssize, data: *void) -> u32 #c_call {
+        state := cast(*Transfer_State) data;
+        // The inventory reports only the main data stream. Keep alternate
+        // stream sizes out of its percentage.
+        if stream_number == 1 {
+            if stream_done > state.last {
+                if #pattern ?counter = state.bytes _ := counter.fetch_add(stream_done - state.last);
+                state.last = stream_done;
+            }
+            if stream_done == stream_size && !state.access_restored {
+                // CopyFileEx preserves modification time but normally sets a
+                // new access time. Both file handles are still open here.
+                access: u64;
+                if get_file_time(source, null, ?&access, null) != 0
+                    state.access_restored = set_file_time(destination, null, ?&access, null) != 0;
+            }
+        }
+        return 0; // PROGRESS_CONTINUE
+    }
+}
+
+copy_data :: (job: *Job, paths: Paths) -> Fs_Error!s64 {
+    #if OUT.os == .Windows && size_of(usize) == 8 {
+        if paths.regular {
+            from := Case_Directory.wide_path(paths.source)?;
+            to := Case_Directory.wide_path(paths.destination)?;
+            state := Transfer_State.{ .bytes = job.confirmed_bytes };
+            // Exclusive creation cannot modify an existing alias or symlink.
+            // If the source was replaced by a link, preserve that link itself.
+            flags: u32 = 16#0001 | 16#0800; // FAIL_IF_EXISTS | COPY_SYMLINK
+            if copy_ex(from.data, to.data, ?transferred, &state, null, flags) != 0 {
+                if !state.access_restored {
+                    info := metadata(paths.source, false)?;
+                    if info.accessed.valid {
+                        if #pattern .Err(error) = set_times(paths.destination, .accessed = info.accessed,
+                            .flags = .Accessed, .follow_symlink = false) {
+                            if preserve_error_is_fatal(error) return .Err(error);
+                        }
+                    }
+                }
+                return .Ok(0);
+            }
+            code := last_error();
+            if (code != 80 && code != 183) || job.policy != .Overwrite
+                return .Err(fs_error_from_os(code, .Copy, paths.source, paths.destination));
+            // Only a pre-existing destination can reach this branch. The std
+            // primitive handles replacement and verifies identities before truncating.
+        }
+    }
+    return copy_file(paths.source, paths.destination, job.policy);
+}
+
+copy_leaf :: (job: *Job, paths: Paths) {
+    #temp_scope {
+        if copy_data(job, paths) == {
+        case .Ok(bytes); credit(job, paths, bytes);
+        case .Err(error); fail(job, error, paths);
+        }
+    }
+}
+
+worker :: (data: *void) -> ?*void #c_call {
+    #push_allocator(heap_allocator());
+    job := cast(*Job) data;
+    #pattern ?queue := job.work else { return null; };
+    while !job.failed.load() {
+        #pattern .Ok(next) := queue.recv() else { break; };
+        #pattern ?paths := next else { break; };
+        defer paths.free();
+        if !job.failed.load() copy_leaf(job, paths);
+    }
+    return null;
+}
+
+check_destination :: (source: str, destination: str) -> Fs_Error!void {
+    invalid := Fs_Error.make_error(.Invalid_Argument, .Copy, 0, source, destination);
+    if path_lexically_contains(source, destination) return .Err(invalid);
+    from := canonical(source)?;
+    defer from.free();
+    if #pattern .Ok(info) = metadata(destination, false) {
+        // Let the directory operation report the kind/exists error for a
+        // final symlink (including a dangling link). It never descends into it.
+        if info.kind != .Directory return .Ok;
+        target := canonical(destination)?;
+        defer target.free();
+        if path_lexically_contains(from, target) return .Err(invalid);
+    } else {
+        parent := path_dirname(destination);
+        if parent.count == 0 parent = ".";
+        target_parent := canonical(parent)?;
+        defer target_parent.free();
+        target := path_join(target_parent, path_basename(destination));
+        defer target.free();
+        if path_lexically_contains(from, target) return .Err(invalid);
+    }
+    return .Ok;
+}
+
+prepare_folder :: (job: *Job, paths: Paths, info: Metadata) -> Fs_Error!Listing {
+    created := false;
+    if metadata(paths.destination, false) == {
+    case .Ok(previous);
+        if previous.kind != .Directory return .Err(Fs_Error.make_error(.Not_A_Directory, .Copy));
+        if job.policy == .Fail_If_Exists return .Err(Fs_Error.make_error(.Already_Exists, .Copy));
+    case .Err(error);
+        if error.kind != .Not_Found return .Err(error);
+        writable := info.permissions | File_Permissions.Owner_Read |
+            File_Permissions.Owner_Write | File_Permissions.Owner_Execute;
+        _ := create_directory(paths.destination, writable)?;
+        created = true;
+        credit(job, paths, 0);
+    }
+    listing: Listing;
+    _ := Case_Directory.prepare(paths.source, paths.destination, created, ?&listing.checked)?;
+    if listing.checked == null listing.cursor = Directory.open_directory(paths.source)?;
+    return .Ok(listing);
+}
+
+copy_entries :: (job: *Job, source: str, destination: str, info: Metadata, restore: *[..]Restore) {
+    stack: [..]Folder;
+    defer stack.free_storage();
+    defer {
+        for *folder: stack {
+            _ := folder.listing.close();
+            folder.paths.free();
+        }
+    }
+    root := Paths.{ .source = source.clone(), .destination = destination.clone() };
+    if prepare_folder(job, root, info) == {
+    case .Err(error); fail(job, error, root); root.free(); return;
+    case .Ok(listing);
+        // Preserve the caller's path semantics for the root operation, then
+        // anchor its descendants at the existing native directories. Windows
+        // returns extended drive/UNC paths even for a short relative input.
+        from, src_code := os_canonical_path(source);
+        to, dst_code := os_canonical_path(destination);
+        if src_code != 0 || dst_code != 0 {
+            code := ifx src_code != 0 src_code else dst_code;
+            fail(job, fs_error_from_os(code, .Copy), root);
+            _ := listing.close();
+            root.free();
+            from.free();
+            to.free();
+            return;
+        }
+        root.free();
+        root = .{ .source = from, .destination = to };
+        stack.push(.{ .paths = root, .listing = listing, .info = info });
+    }
+    while stack.count > 0 && !job.failed.load() {
+        #temp_scope {
+            folder := &stack[stack.count - 1];
+            if folder.listing.next() == {
+            case .Err(error); fail(job, error, folder.paths); return;
+            case .Ok(next);
+                if next == {
+                case null;
+                    if #pattern .Err(error) = folder.listing.close() {
+                        fail(job, error, folder.paths);
+                        return;
+                    }
+                    // Already in postorder. Keep both diagnostic paths until
+                    // workers release the last child's file handles.
+                    restore.push(.{ .paths = folder.paths, .info = folder.info });
+                    stack.count -= 1;
+                case ?entry;
+                    paths := Paths.{ .source = path_join(folder.paths.source, entry.name),
+                        .destination = path_join(folder.paths.destination, entry.name) };
+                    kind := entry.kind;
+                    if kind == .Directory || !entry.has_kind {
+                        if metadata(paths.source, false) == {
+                        case .Err(error); fail(job, error, paths); paths.free(); return;
+                        case .Ok(child);
+                            kind = child.kind;
+                            if kind == .Directory {
+                                if child.file_id.valid {
+                                    for ancestor: stack {
+                                        id := ancestor.info.file_id;
+                                        if id.valid && id.high == child.file_id.high && id.low == child.file_id.low &&
+                                            id.file_high == child.file_id.file_high {
+                                            fail(job, Fs_Error.make_error(.Too_Many_Links, .Copy), paths);
+                                            paths.free();
+                                            return;
+                                        }
+                                    }
+                                }
+                                if prepare_folder(job, paths, child) == {
+                                case .Err(error); fail(job, error, paths); paths.free(); return;
+                                case .Ok(listing); stack.push(.{ .paths = paths, .listing = listing, .info = child });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    if kind != .Regular && kind != .Symlink {
+                        fail(job, Fs_Error.make_error(.Unsupported, .Copy), paths);
+                        paths.free();
+                        return;
+                    }
+                    paths.regular = kind == .Regular;
+                    if #pattern ?queue = job.work {
+                        // send takes ownership even when another worker failed
+                        // and closed the queue while the enumerator was busy.
+                        if queue.send(paths).is_err() return;
+                    } else {
+                        copy_leaf(job, paths);
+                        paths.free();
+                    }
+                }
+            }
+        }
+    }
+}
+
+preserve_error_is_fatal :: (error: Fs_Error) -> bool {
+    return error.kind != .Permission_Denied && error.kind != .Unsupported && error.kind != .Read_Only_File_System;
+}
+
+restore_folder :: (item: *Restore) -> Fs_Error!void {
+    // Match copy_tree: timestamps first, then potentially read-only permissions.
+    flags := Time_Update_Flags.None;
+    if item.info.accessed.valid flags = flags | Time_Update_Flags.Accessed;
+    if item.info.modified.valid flags = flags | Time_Update_Flags.Modified;
+    if flags != .None {
+        if #pattern .Err(error) = set_times(item.paths.destination, item.info.accessed, item.info.modified, flags) {
+            if preserve_error_is_fatal(error) return .Err(error);
+        }
+    }
+    if #pattern .Err(error) = change_mode(item.paths.destination, item.info.permissions) {
+        if preserve_error_is_fatal(error) return .Err(error);
+    }
+    return .Ok;
+}
+
+#public copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
+    observer: Copy_Observer = .{}, confirmed_bytes: ?*Atomic(s64) = null) -> Fs_Error!ssize {
+    // The enumerator owns queued paths until send; a worker then frees them.
+    #push_allocator(heap_allocator());
+    if #pattern .Err(error) = check_destination(source, destination)
+        return .Err(error.with_path(source, destination));
+    job := Job.{ .policy = policy, .observer = observer, .confirmed_bytes = confirmed_bytes };
+    threads: [..]Thread;
+    defer threads.free_storage();
+    if #pattern .Ok(queue) = Channel(Paths).new() {
+        job.work = ?queue;
+        for index: 0..6 {
+            #pattern .Ok(thread) := Thread.spawn(worker, &job) else { break; };
+            threads.push(thread);
+        }
+        if threads.count == 0 { queue.free(); job.work = null; }
+    }
+    restore: [..]Restore;
+    defer { for *item: restore item.paths.free(); restore.free_storage(); }
+    copy_entries(&job, source, destination, info, &restore);
+    if #pattern ?queue = job.work {
+        queue.close();
+        for *thread: threads _ := thread.join();
+        queue.free();
+    }
+    if !job.failed.load() {
+        for *item: restore {
+            if #pattern .Err(error) = restore_folder(item) {
+                job.work = null;
+                fail(&job, error, item.paths);
+                break;
+            }
+        }
+    }
+    if job.failed.load() {
+        error := job.error;
+        error.completed = job.completed;
+        if !observer.child_errors return .Err(error.with_path(source, destination));
+        defer error.path.free(heap_allocator());
+        defer error.other_path.free(heap_allocator());
+        return .Err(error.with_path(error.path.clone(context.temp_allocator).into_temporary(),
+            error.other_path.clone(context.temp_allocator).into_temporary()));
+    }
+    return .Ok(job.completed);
+}

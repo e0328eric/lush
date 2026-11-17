@@ -58,6 +58,8 @@ The interactive editor supports Unicode text, cursor movement, Home/End,
 Backspace/Delete, Lua syntax highlighting, persistent Up/Down history, history autosuggestions, executable
 and path completion with Tab, and bracketed paste. Ctrl+L clears the screen and
 redraws the prompt with the current input.
+At the start of a `... ` continuation line, Backspace removes the newline and
+puts the cursor at the join, keeping any text to its right.
 Ctrl+C clears the current submission; Ctrl+D on an empty line exits.
 The terminal's normal modes are restored before running Lua or an external
 program. Redirected stdin uses a prompt-free, line-oriented REPL.
@@ -322,6 +324,13 @@ use `show(ls("-la"))` or `show(sl())` to display a listing or run the animation.
 `ls("--lol=signal")` allows interrupting the animation. Snapshot flags from `fls`
 are also available, for example `show(sl("--snapshot", "-w", "80"))`.
 
+On Windows, opening a file in `ls("--tui")` uses its default application through
+the same native handler as `lush.open`. `FLS_OPENER` and `NNN_OPENER` override it.
+Press `p` to copy selected entries into the current directory. During longer
+copies and deletions, the bottom row shows progress and the current selection
+number (for example, `3/8`). A long listing such as `ls("-l", "--total-size")`
+shows how many entries it has scanned while it calculates directory sizes.
+
 The same listing remains structured when collected or transformed:
 
 ```lua
@@ -446,14 +455,17 @@ the fields. For a record stream, inspect `value:columns()` or `value:first(1)`;
 inspect decoded scalar/list values directly. Enumerated records always have
 `index` and `item`, while the fields inside `item` follow the original data.
 
-Filesystem operations use literal paths and Glosso's native filesystem APIs:
+In filesystem commands, `~` means `%USERPROFILE%` on Windows and `$HOME` on
+POSIX. Use `~/` on either platform. Windows also accepts a backslash after the
+tilde. Only a leading `~` component expands, so `~draft` is a regular filename
+and `./~` addresses an entry named `~` in the current directory.
 
 ```lua
 mkdir("work/output")
 touch("work/output/notes.txt")
 cp("notes.txt", "backup.txt")
-mv("backup.txt", "renamed.txt")
-rm("renamed.txt")
+mv("backup.txt", "~/renamed.txt")
+rm("~/renamed.txt")
 stat("notes.txt")
 exists("notes.txt")
 path.join("work", "notes.txt")
@@ -461,10 +473,23 @@ path.basename("work/notes.txt")
 path.expand("~/work")
 ```
 
+`cd()` and `cd("~")` both go home. To pass a home-relative path as an argument
+to an external program, use `path.expand`, for example
+`cmd.git("-C", path.expand("~/work"), "status")`.
+
 Copy and move use the exact destination path and refuse to overwrite existing
-files by default. Set `{overwrite=true}` explicitly to replace them. Copying a
-directory or deleting a nonempty directory requires `{recursive=true}`. Directory
-copy with both options merges into the destination tree. `rm` deletes directly;
+files by default. Set `{overwrite=true}` explicitly to replace them. When stderr
+is a terminal, copies lasting about 250 ms or longer show the percentage of
+bytes copied across the file or directory tree. On Windows, recursive copies
+start transferring files while counting the total. The display shows bytes
+transferred, a percentage, and the completed entry count when space permits.
+If files differ only by case, Lush tries
+to enable case sensitivity on the corresponding new directory. If Windows
+refuses, the error names the conflicting entries before either is written in
+that directory. Recursive deletion reports the number of entries removed after
+the same delay. Copying a directory or
+deleting a nonempty directory requires `{recursive=true}`. A directory copy
+with both options merges into the destination tree. `rm` deletes directly;
 it does not move files to a recycle bin. `touch` preserves existing contents.
 The `path` table also provides `dirname`, `stem`, `extension`, `normalize`, and
 `exists`.
@@ -612,7 +637,8 @@ continues with its built-in defaults. Errors in an existing configuration remain
 errors. `--no-config` skips loading and creation and cannot be combined with
 `--config`.
 
-`pwd()`, `cd(path)`, and `env.NAME = "value"` update the parent shell session.
+`pwd()` returns the current working directory with forward slash (`/`) separators,
+including on Windows. `cd(path)` and `env.NAME = "value"` update the parent shell session.
 Assigning nil to `env.NAME` removes the environment variable. Children inherit
 that directory and environment. `cat(path)` or `lush.read(path)` reads bytes;
 `lush.write(path, bytes, append)` writes bytes. On Windows, `open(target)` opens
@@ -701,6 +727,7 @@ python tests/shell.py --exe build/lush.exe
 python tests/fls.py --exe build/lush.exe
 python tests/windows_console.py --exe build/lush.exe  # Windows native console
 python tests/tui_cursor.py --exe build/lush.exe       # ConPTY cursor paint ordering
+python tests/tui_open.py --exe build/lush.exe         # Windows browser opener and navigation
 python tests/repl_cursor.py --exe build/lush.exe      # Prompt redraws and unchanged keys
 python tests/history.py --exe build/lush.exe          # Persistence and history suggestions
 python tests/highlighting.py --exe build/lush.exe     # Lua input colors and caret behavior

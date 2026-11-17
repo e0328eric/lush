@@ -16,7 +16,7 @@ end
 function which(name)
     text(name, "executable name")
     assert(#name > 0, "executable name must not be empty")
-    return native.which(name)
+    return native.which(native.path_arg(name))
 end
 function describe(value)
     if value == json.null then return "null" end

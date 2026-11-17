@@ -5,10 +5,10 @@
 #import "Context";
 #import "Memory/Arena";
 #import "Memory/Ownership";
+#import "Terminal";
 #import "File_System/File";
 #import "File_System/System";
-#import "File_System/Directory";
-#import "File_System/Metadata";
+#import "../vendor/fls/src/directory_size.glo";
 Options :: #import "../vendor/fls/src/options.glo";
 Cli :: #import "../vendor/fls/src/cli.glo";
 Entries :: #import "../vendor/fls/src/entry.glo";
@@ -139,6 +139,9 @@ records :: (args: []const str) -> Record_List {
         return result;
     }
     if options.paths.count == 0 options.paths.push(".");
+    scan: Size_Scan;
+    if options.total_size scan = Size_Scan.start(terminal_capabilities().unwrap_or(.{}).interactive);
+    defer scan.clear();
     files: [..]Entries.Entry;
     defer files.free();
     directories: [..]Entries.Entry;
@@ -169,15 +172,15 @@ records :: (args: []const str) -> Record_List {
         for *entry: directories roots.push(value_take(entry));
         Entries.sort_entries(roots.view(), options.sort);
         for *entry: roots {
-            append_record(&result, entry, &options, 0);
+            append_record(&result, entry, &options, 0, &scan);
             if entry.is_dir && !options.list_dirs {
-                if !collect_directory(&result, entry.path, &options, 1) return result;
+                if !collect_directory(&result, entry.path, &options, 1, &scan) return result;
             }
         }
     } else {
-        for *entry: files append_record(&result, entry, &options, 0);
+        for *entry: files append_record(&result, entry, &options, 0, &scan);
         for entry: directories {
-            if !collect_directory(&result, entry.path, &options, 0) return result;
+            if !collect_directory(&result, entry.path, &options, 0, &scan) return result;
         }
     }
     return result;
@@ -198,22 +201,8 @@ kind_name :: (entry: *Entries.Entry) -> str {
     }
 }
 
-directory_size :: (path: str, depth: s64 = 0) -> s64 {
-    if depth > 64 return 0;
-    #pattern .Ok(list) := read_directory(path) else { return 0; };
-    defer list.free();
-    total: s64;
-    for item: list.entries {
-        child := Util.join_path(path, item.name);
-        defer child.free();
-        #pattern .Ok(meta) := metadata(child) else { continue; };
-        if meta.kind == .Directory total += directory_size(child, depth + 1);
-        else total += meta.size;
-    }
-    return total;
-}
-
-append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options.Options, depth: s64) {
+append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options.Options, depth: s64,
+    scan: *Size_Scan) {
     record: Record;
     record.name = entry.name.clone();
     record.path = entry.path.clone();
@@ -224,7 +213,7 @@ append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options
     record.modified_valid = entry.meta.modified.valid;
     record.depth = depth;
     if options.total_size && entry.meta.kind == .Directory && entry.name != ".."
-        record.size = directory_size(entry.path);
+        record.size = scan.measure(entry.path).unwrap_or(0);
     if options.git {
         directory := Util.parent_path(entry.path);
         if entry.is_dir && (entry.name == "." || entry.path == ".") directory = entry.path;
@@ -237,7 +226,8 @@ append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options
     result.items.push(record);
 }
 
-collect_directory :: (result: *Record_List, path: str, options: *Options.Options, depth: s64) -> bool {
+collect_directory :: (result: *Record_List, path: str, options: *Options.Options, depth: s64,
+    scan: *Size_Scan) -> bool {
     if options.tree && options.level >= 0 && depth > options.level return true;
     if depth > 1024 {
         result.code = 2;
@@ -253,16 +243,16 @@ collect_directory :: (result: *Record_List, path: str, options: *Options.Options
     defer entries.free();
     Entries.sort_entries(entries.view(), options.sort);
     for *entry: entries {
-        append_record(result, entry, options, depth);
+        append_record(result, entry, options, depth, scan);
         if options.tree && entry.stat_ok && entry.meta.kind == .Directory &&
             entry.name != "." && entry.name != ".." {
-            if !collect_directory(result, entry.path, options, depth + 1) return false;
+            if !collect_directory(result, entry.path, options, depth + 1, scan) return false;
         }
     }
     if !options.tree && options.recurse && (options.level < 0 || depth + 1 < options.level) {
         for entry: entries {
             if entry.stat_ok && entry.meta.kind == .Directory && entry.name != "." && entry.name != ".." {
-                if !collect_directory(result, entry.path, options, depth + 1) return false;
+                if !collect_directory(result, entry.path, options, depth + 1, scan) return false;
             }
         }
     }

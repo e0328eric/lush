@@ -7,6 +7,7 @@
 #import "Strings";
 #import "util.glo";
 #import "entry.glo";
+Home :: #import "../../../src/home_path.glo";
 
 #public {
 
@@ -73,6 +74,7 @@ Options :: struct {
     time_style: Time_Style = .Default;
 
     paths: [..]str;
+    expanded_paths: [..]str;
 
     tui: bool;
     cd_file: str;
@@ -86,6 +88,8 @@ Options :: struct {
 
 free_options :: (o: *Options) {
     o.paths.free();
+    for path: o.expanded_paths path.free();
+    o.expanded_paths.free();
     o.filter.ignore.free();
 }
 
@@ -188,7 +192,8 @@ parse_options :: (args: []const str, options: *Options) -> Parse_Result {
         arg := args[i];
         i += 1;
         if only_paths || arg.count < 2 || arg[0] != #char "-" {
-            options.paths.push(arg);
+            #pattern ?path := option_path(options, arg) else { return fail(Home.unavailable()); };
+            options.paths.push(path);
             continue;
         }
         if arg == "--" {
@@ -242,6 +247,15 @@ parse_options :: (args: []const str, options: *Options) -> Parse_Result {
 
 fail :: (message: str) -> Parse_Result {
     return .{ false, message };
+}
+
+// Parsed options normally borrow argv. Expanded paths must survive the
+// renderer's temporary-storage resets until free_options.
+option_path :: (o: *Options, value: str) -> ?str {
+    if !Home.has_prefix(value) return ?value;
+    #pattern ?path := Home.from_home(value[1..]) else { return null; };
+    o.expanded_paths.push(path);
+    return ?path;
 }
 
 short_takes_value :: (c: u8) -> bool {
@@ -367,7 +381,8 @@ apply_long :: (o: *Options, name: str, value: str, has_value: bool) -> Parse_Res
     case "tui";
         o.tui = true;
     case "cd-file";
-        o.cd_file = value;
+        #pattern ?path := option_path(o, value) else { return fail(Home.unavailable()); };
+        o.cd_file = path;
     case "snapshot";
         o.snapshot = true;
     case "keys";

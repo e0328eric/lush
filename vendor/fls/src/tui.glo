@@ -18,7 +18,7 @@
 #import "File_System/System";
 #import "File_System/Directory";
 #import "File_System/Metadata";
-#import "File_System/Copy";
+Paths :: #import "File_System/Path";
 #import "Process/Environment";
 #import "Process/Command";
 #import "Memory/Ownership";
@@ -27,6 +27,11 @@
 #import "entry.glo";
 #import "options.glo";
 Screen :: #import "../../../src/screen.glo";
+Opener :: #import "../../../src/opener.glo";
+Home :: #import "../../../src/home_path.glo";
+Copy_Progress :: #import "../../../src/copy_progress.glo";
+Remove_Progress :: #import "../../../src/remove_progress.glo";
+Progress :: #import "../../../src/progress_display.glo";
 
 CONTEXTS :: 4;
 
@@ -171,7 +176,7 @@ run_tui :: (options: *Options, snapshot: bool, keys: str) -> s32 {
     app.options = options;
     app.icons = options.icons != .Never;
     app.detail = options.layout == .Long;
-    app.home = owned_environment("HOME", "");
+    app.home = Home.directory();
     start := ifx options.paths.count > 0 options.paths[0] else ".";
     resolved := canonical(start).unwrap_or("");
     if resolved.count == 0 || !is_directory(resolved).unwrap_or(false) {
@@ -745,6 +750,19 @@ open_current :: (app: *App) {
     }
     if opener.count == 0 {
         opener.free();
+        #if OUT.os == .Windows {
+            // Use the same literal Windows association handoff as lush.open.
+            // Snapshot key replay must remain a dry run.
+            if !app.have_session {
+                set_message(app, tprint("would open: {}", e.path));
+                return;
+            }
+            result := Opener.open_target(e.path);
+            defer result.error.free();
+            if result.ok set_message(app, tprint("opened: {}", e.path));
+            else set_message(app, result.error, true);
+            return;
+        }
         opener = "xdg-open".clone();
     }
     defer opener.free();
@@ -985,14 +1003,16 @@ submit_prompt :: (app: *App, kind: Prompt_Kind, text: str) {
             load_current(app, first);
         }
     case .Change_Dir;
-        path := text;
-        if path == "~" || path.starts_with("~/") path = tprint(
-            "{}{}",
-            app.home,
-            path[1..path.count]
-        );
-        else if path[0] != #char "/" path = tprint("{}/{}", tab.path, path);
-        change_dir(app, path);
+        #pattern ?path := Home.resolve(text, context.temp_allocator) else {
+            set_message(app, Home.unavailable(), true);
+            return;
+        };
+        if Paths.path_is_rooted(path) change_dir(app, path);
+        else {
+            joined := join_path(tab.path, path);
+            defer joined.free();
+            change_dir(app, joined);
+        }
     case .Open_With;
         #pattern ?e := current_entry(app) else {
             return;
@@ -1005,6 +1025,56 @@ submit_prompt :: (app: *App, kind: Prompt_Kind, text: str) {
 // ---------------------------------------------------------------------------
 // File operations.
 
+File_Status :: struct {
+    app: *App;
+    row: Terminal_Canvas;
+    timing: Progress.Timing;
+    item: ssize;
+    deleting: bool;
+    // Entries removed across the preceding targets in this selection.
+    deleted: s64;
+}
+
+paint_file_status :: (status: *File_Status, done: s64, total: s64, complete: bool = false, entries: s64 = -1) {
+    if !status.app.have_session return;
+    if complete {
+        if !status.timing.visible return;
+    } else if !status.timing.ready() return;
+    session := &status.app.session;
+    _ := session.size();
+    width := cast(ssize) session.capabilities.columns;
+    height := cast(ssize) session.capabilities.rows;
+    if width <= 0 || height <= 0 return;
+    #temp_scope {
+        status.row.resize(width, 1);
+        style := chrome(150, Terminal_Color.terminal_color_indexed(235));
+        status.row.clear(style);
+        count := status.app.selection.count;
+        label := ifx count > 1 tprint("{}/{} ", status.item, count) else "";
+        if width - label.count < 16 label = "";
+        status.row.text(0, 0, label, style);
+        columns := width - label.count;
+        line := ifx status.deleting Progress.entries_label("Deleted", status.deleted + done, columns)
+            else Progress.copy_label(done, total, complete, columns, entries);
+        status.row.text(label.count, 0, line, style);
+        _ := status.row.render_at(session, 0, height - 1);
+    }
+}
+
+copy_update :: (state: *void, done: s64, total: s64, entries: s64) {
+    paint_file_status(cast(*File_Status) state, done, total, .entries = entries);
+}
+
+deletion_update :: (state: *void, removed: s64) {
+    paint_file_status(cast(*File_Status) state, removed, 0);
+}
+
+remove_tree :: (path: str, status: *File_Status) -> Fs_Error!ssize {
+    callback: ?((*void, s64) -> void);
+    if status.app.have_session callback = ?deletion_update;
+    return Remove_Progress.remove_tree(path, callback, cast(*void) status);
+}
+
 /// Copies (or moves) the selection into the current directory.
 paste_selection :: (app: *App, move: bool) {
     if app.selection.count == 0 {
@@ -1015,9 +1085,14 @@ paste_selection :: (app: *App, move: bool) {
     done := 0;
     failed := 0;
     last_error := "";
-    for source: app.selection {
+    status := File_Status.{ .app = app, .timing = Progress.Timing.start() };
+    defer status.row.free();
+    for source, index: app.selection {
+        status.item = index + 1;
+        status.deleting = false;
         name := base_name(source);
-        target := tprint("{}/{}", tab.path, name);
+        target := join_path(tab.path, name);
+        defer target.free();
         if target == source {
             failed += 1;
             last_error = "source and destination are the same";
@@ -1028,7 +1103,7 @@ paste_selection :: (app: *App, move: bool) {
             last_error = tprint("{} already exists", name);
             continue;
         }
-        error_code: s64 = 0;
+        failure: str;
         ok := false;
         if move {
             if rename(source, target, false) == {
@@ -1036,48 +1111,57 @@ paste_selection :: (app: *App, move: bool) {
                 ok = true;
             case .Err(error);
                 if error.kind == .Cross_Device {
-                    ok = copy_path(source, target, &error_code);
-                    if ok _ := remove_all(source);
-                } else error_code = error.os_code;
+                    ok = copy_path(source, target, &failure, &status);
+                    if ok {
+                        status.deleting = true;
+                        if remove_tree(source, &status) == {
+                        case .Ok(removed); status.deleted += removed;
+                        case .Err(cleanup_error);
+                            status.deleted += cleanup_error.completed;
+                            failure = os_error_text(cleanup_error.os_code);
+                            ok = false;
+                        }
+                    }
+                } else failure = os_error_text(error.os_code);
             }
         } else {
-            ok = copy_path(source, target, &error_code);
+            ok = copy_path(source, target, &failure, &status);
         }
         if ok done += 1;
         else {
             failed += 1;
-            last_error = tprint("{}: {}", name, os_error_text(error_code));
+            last_error = tprint("{}: {}", name, failure);
         }
     }
     verb := ifx move "moved" else "copied";
-    if failed == 0 set_message(app, tprint("{} {} item(s)", verb, done));
-    else set_message(app, tprint("{} {}, {} failed ({})", verb, done, failed, last_error), true);
+    if failed == 0 {
+        paint_file_status(&status, 0, 0, true);
+        set_message(app, tprint("{} {} item(s)", verb, done));
+    } else set_message(app, tprint("{} {}, {} failed ({})", verb, done, failed, last_error), true);
     if done > 0 && move clear_selection(app);
     reload_keep_cursor(app);
 }
 
-copy_path :: (source: str, target: str, code: *s64) -> bool {
-    if is_directory(source).unwrap_or(false) && !is_symlink(source).unwrap_or(false) {
-        if copy_tree(
-            source,
-            target,
-            .Fail_If_Exists,
-            Copy_Flags.Default | .Recursive | .Preserve_Links
-        ) == {
-        case .Ok;
-            return true;
-        case .Err(error);
-            code.* = error.os_code;
-            return false;
+copy_path :: (source: str, target: str, message: *str, status: *File_Status) -> bool {
+    if metadata(source, false) == {
+    case .Err(error);
+        message.* = os_error_text(error.os_code);
+        return false;
+    case .Ok(info);
+        callback: ?Copy_Progress.Progress;
+        if status.app.have_session callback = ?copy_update;
+        if Copy_Progress.copy(source, target, info, .Fail_If_Exists, callback, cast(*void) status) == {
+        case .Ok; return true;
+        case .Err(error); message.* = Copy_Progress.error_message(error); return false;
         }
     }
-    if copy_file(source, target, .Fail_If_Exists, Copy_Flags.Default | .Preserve_Links) == {
-    case .Ok;
-        return true;
-    case .Err(error);
-        code.* = error.os_code;
-        return false;
-    }
+}
+
+delete_path :: (path: str, status: *File_Status) -> Fs_Error!ssize {
+    if is_directory(path).unwrap_or(false) && !is_symlink(path).unwrap_or(false)
+        return remove_tree(path, status);
+    _ := remove(path)?;
+    return .Ok(1);
 }
 
 delete_targets :: (app: *App) {
@@ -1091,26 +1175,22 @@ delete_targets :: (app: *App) {
     done := 0;
     failed := 0;
     last_error := "";
-    for path: targets {
-        dir := is_directory(path).unwrap_or(false) && !is_symlink(path).unwrap_or(false);
-        if dir {
-            if remove_all(path) == {
-            case .Ok;
-                done += 1;
-            case .Err(error);
-                failed += 1;
-                last_error = tprint("{}: {}", base_name(path), os_error_text(error.os_code));
-            }
-        } else {
-            if remove(path) == {
-            case .Ok;
-                done += 1;
-            case .Err(error);
-                failed += 1;
-                last_error = tprint("{}: {}", base_name(path), os_error_text(error.os_code));
-            }
+    status := File_Status.{ .app = app, .timing = Progress.Timing.start(), .deleting = true };
+    defer status.row.free();
+    for path, index: targets {
+        status.item = index + 1;
+        if delete_path(path, &status) == {
+        case .Ok(removed);
+            status.deleted += removed;
+            done += 1;
+        case .Err(error);
+            status.deleted += error.completed;
+            failed += 1;
+            last_error = tprint("{}: {}", base_name(path), os_error_text(error.os_code));
         }
+        paint_file_status(&status, 0, 0);
     }
+    paint_file_status(&status, 0, 0, true);
     if failed == 0 set_message(app, tprint("deleted {} item(s)", done));
     else set_message(app, tprint("deleted {}, {} failed ({})", done, failed, last_error), true);
     clear_selection(app);

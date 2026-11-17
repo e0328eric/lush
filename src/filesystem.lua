@@ -1,5 +1,6 @@
--- Literal filesystem operations; all OS work uses Glosso's native std library.
+-- Filesystem operations backed by Glosso's native standard library.
 local native = assert(_lush)
+local path_arg = native.path_arg
 local lua_type, lua_error, lua_pairs = type, error, pairs
 local function fail(message) lua_error(message, 3) end
 local function text(value, name)
@@ -24,27 +25,27 @@ end
 
 function mkdir(value, opts)
     opts = options(opts, {parents = true}, "mkdir")
-    return checked(native.mkdir(text(value), opts.parents ~= false))
+    return checked(native.mkdir(path_arg(value), opts.parents ~= false))
 end
-function touch(value) return checked(native.touch(text(value))) end
+function touch(value) return checked(native.touch(path_arg(value))) end
 function cp(source, destination, opts)
     opts = options(opts, {recursive = true, overwrite = true}, "cp")
-    return checked(native.cp(text(source, "source"), text(destination, "destination"),
+    return checked(native.cp(path_arg(source, "source"), path_arg(destination, "destination"),
                              opts.recursive == true, opts.overwrite == true))
 end
 function mv(source, destination, opts)
     opts = options(opts, {overwrite = true}, "mv")
-    return checked(native.mv(text(source, "source"), text(destination, "destination"), opts.overwrite == true))
+    return checked(native.mv(path_arg(source, "source"), path_arg(destination, "destination"), opts.overwrite == true))
 end
 function rm(value, opts)
     opts = options(opts, {recursive = true, force = true}, "rm")
-    return checked(native.rm(text(value), opts.recursive == true, opts.force == true))
+    return checked(native.rm(path_arg(value), opts.recursive == true, opts.force == true))
 end
 function stat(value, follow)
     if follow ~= nil and lua_type(follow) ~= "boolean" then fail("stat follow must be a boolean") end
-    return checked(native.stat(text(value), follow ~= false))
+    return checked(native.stat(path_arg(value), follow ~= false))
 end
-function exists(value) return checked(native.exists(text(value))) end
+function exists(value) return checked(native.exists(path_arg(value))) end
 
 path = {}
 function path.join(...)

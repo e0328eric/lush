@@ -12,6 +12,7 @@
 #import "Unicode";
 #import "Process";
 #import "Process/Environment";
+Paths :: #import "File_System/Path";
 
 #public {
 
@@ -212,6 +213,7 @@ glob_match :: (pattern: str, text: str) -> bool {
 
 /// Final path component of `path`, ignoring trailing slashes.
 base_name :: (path: str) -> str {
+    #if OUT.os == .Windows return Paths.path_basename(path);
     end := path.count;
     while end > 1 && path[end - 1] == #char "/" end -= 1;
     i := end;
@@ -222,6 +224,7 @@ base_name :: (path: str) -> str {
 
 /// Parent directory of `path` ("/" for the root, "." for a bare name).
 parent_path :: (path: str) -> str {
+    #if OUT.os == .Windows return Paths.path_dirname(path);
     end := path.count;
     while end > 1 && path[end - 1] == #char "/" end -= 1;
     i := end;
@@ -233,6 +236,9 @@ parent_path :: (path: str) -> str {
 
 /// `dir/name` as a newly allocated string. The caller frees it.
 join_path :: (dir: str, name: str) -> str {
+    // Canonical Windows paths use verbatim syntax, which forbids '/'. Keep
+    // ordinary listing paths in their original spelling (including './').
+    #if OUT.os == .Windows if dir.starts_with("\\\\?\\") return Paths.path_join(dir, name);
     if dir.count == 0 return name.clone();
     if dir[dir.count - 1] == #char "/" return format("{}{}", dir, name);
     return format("{}/{}", dir, name);
