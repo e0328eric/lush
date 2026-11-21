@@ -324,6 +324,12 @@ use `show(ls("-la"))` or `show(sl())` to display a listing or run the animation.
 `ls("--lol=signal")` allows interrupting the animation. Snapshot flags from `fls`
 are also available, for example `show(sl("--snapshot", "-w", "80"))`.
 
+In `ls("--tui")`, press `q` to return to Lush in the active tab's directory.
+Press `Q` to return to the directory where you launched the browser.
+Press `n` and enter `notes/drafts/` to create a directory, or
+`notes/drafts/report.txt` to create an empty file. Both forms create missing
+parent directories. Windows also accepts backslashes.
+
 On Windows, opening a file in `ls("--tui")` uses its default application through
 the same native handler as `lush.open`. `FLS_OPENER` and `NNN_OPENER` override it.
 Press `p` to copy selected entries into the current directory. During longer
@@ -727,6 +733,7 @@ python tests/shell.py --exe build/lush.exe
 python tests/fls.py --exe build/lush.exe
 python tests/windows_console.py --exe build/lush.exe  # Windows native console
 python tests/tui_cursor.py --exe build/lush.exe       # ConPTY cursor paint ordering
+python tests/tui_memory.py --exe build/lush.exe       # Windows scroll memory across browser visits
 python tests/tui_open.py --exe build/lush.exe         # Windows browser opener and navigation
 python tests/repl_cursor.py --exe build/lush.exe      # Prompt redraws and unchanged keys
 python tests/history.py --exe build/lush.exe          # Persistence and history suggestions

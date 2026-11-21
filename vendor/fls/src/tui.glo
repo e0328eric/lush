@@ -120,7 +120,7 @@ App :: struct {
     dir_modified: s64;
     load_error: str;
     quit: bool;
-    write_cd: bool;
+    accept_directory: bool;
     list_rows: ssize = 1;
     last_click_ms: s64;
     last_click_row: ssize = -1;
@@ -177,15 +177,17 @@ run_tui :: (options: *Options, snapshot: bool, keys: str) -> s32 {
     app.icons = options.icons != .Never;
     app.detail = options.layout == .Long;
     app.home = Home.directory();
+    #if OUT.os == .Windows if #pattern ?home = canonical_directory(app.home) {
+        app.home.free();
+        app.home = home;
+    }
     start := ifx options.paths.count > 0 options.paths[0] else ".";
-    resolved := canonical(start).unwrap_or("");
-    if resolved.count == 0 || !is_directory(resolved).unwrap_or(false) {
-        resolved.free();
+    #pattern ?resolved := canonical_directory(start) else {
         stderr := File.stderr();
         defer stderr.free();
         _ := stderr.writef("fls: {}: not a directory\n", start);
         return 2;
-    }
+    };
     app.start_dir = resolved;
     tab := &app.tabs[0];
     tab.used = true;
@@ -197,12 +199,56 @@ run_tui :: (options: *Options, snapshot: bool, keys: str) -> s32 {
 
     if snapshot return run_snapshot(&app, keys);
     status := run_interactive(&app);
-    if app.write_cd && options.cd_file.count > 0 {
-        _ := write_file(options.cd_file, tprint("{}\n", current_tab(&app).path));
+    if status != 0 || !app.accept_directory return status;
+    path := current_tab(&app).path;
+    if options.cd_file.count > 0 _ := write_file(options.cd_file, tprint("{}\n", path));
+    if #pattern ?reason = enter_browser_directory(path) {
+        stderr := File.stderr();
+        defer stderr.free();
+        _ := stderr.writef("fls: cannot enter {}: {}\n", path, reason);
+        return 2;
     }
-    return status;
+    return 0;
 }
 
+}
+
+#if OUT.os == .Windows {
+    #import "Strings/Utf16";
+    kernel :: #library,system "kernel32";
+    full_path_name :: (name: [*]const u16, capacity: u32, buffer: [*]u16, file_part: ?*void) -> u32
+        #foreign kernel "GetFullPathNameW";
+
+    // Win32 can trim periods and spaces when interpreting a working directory.
+    // Both spellings can exist on disk, so check before changing the shell's cwd.
+    windows_preserves_directory_name :: (path: str) -> bool {
+        wide := path.cstring16_from_string(context.temp_allocator);
+        units := wide.units();
+        normalized: [..]u16;
+        defer normalized.free();
+        normalized.resize(units.count + 1);
+        count := full_path_name(wide.data, cast(u32) normalized.count, normalized.data, null);
+        if cast(ssize) count != units.count return false;
+        for unit, i: units if normalized[i] != unit return false;
+        return true;
+    }
+}
+
+working_directory_path :: (path: str) -> ?str {
+    target := conventional_path(path);
+    #if OUT.os == .Windows if target != path && !windows_preserves_directory_name(target)
+        return null;
+    return ?target;
+}
+
+WORKING_DIRECTORY_ERROR :: "Windows cannot use the exact name as a working directory";
+
+enter_browser_directory :: (path: str) -> ?str {
+    #pattern ?target := working_directory_path(path) else { return ?WORKING_DIRECTORY_ERROR; };
+    if set_current_directory(target) == {
+    case .Ok; return null;
+    case .Err(error); return ?os_error_text(error.os_code);
+    }
 }
 
 run_interactive :: (app: *App) -> s32 {
@@ -218,6 +264,8 @@ run_interactive :: (app: *App) -> s32 {
     dirty := true;
     idle_ticks := 0;
     while !app.quit {
+        mark := temp_mark();
+        defer temp_rewind(mark);
         if app.session.size() == {
         case .Ok(size);
             w := cast(ssize) size.columns.max(1);
@@ -236,7 +284,6 @@ run_interactive :: (app: *App) -> s32 {
             else;
             }
             dirty = false;
-            reset_temporary_storage();
         }
         event := app.session.read_event(1000);
         if app.session.input_closed break;
@@ -290,6 +337,8 @@ run_snapshot :: (app: *App, keys: str) -> s32 {
     defer canvas.free();
     i: ssize = 0;
     while i < keys.count {
+        mark := temp_mark();
+        defer temp_rewind(mark);
         key, used := parse_key_token(keys, i);
         i += used;
         render(app, &canvas);
@@ -456,14 +505,19 @@ clamp_cursor :: (app: *App) {
     if tab.cursor < 0 tab.cursor = 0;
 }
 
+canonical_directory :: (path: str) -> ?str {
+    #pattern .Ok(resolved) := canonical(path) else { return null; };
+    if is_directory(resolved).unwrap_or(false) return ?resolved;
+    resolved.free();
+    return null;
+}
+
 /// Changes the current tab's directory, remembering where it came from.
 change_dir :: (app: *App, path: str, focus: str = "") {
-    resolved := canonical(path).unwrap_or("");
-    if resolved.count == 0 || !is_directory(resolved).unwrap_or(false) {
-        resolved.free();
+    #pattern ?resolved := canonical_directory(path) else {
         set_message(app, tprint("cannot open {}", path), true);
         return;
-    }
+    };
     tab := current_tab(app);
     if resolved == tab.path {
         resolved.free();
@@ -641,13 +695,13 @@ handle_key :: (app: *App, key: Terminal_Key, canvas: *Terminal_Canvas) {
         clamp_cursor(app);
     case #char "q";
         app.quit = true;
-        app.write_cd = true;
+        app.accept_directory = true;
     case #char "Q";
         app.quit = true;
     case #char "~";
         if app.home.count > 0 change_dir(app, app.home);
     case #char "`";
-        change_dir(app, "/");
+        change_dir(app, Paths.path_parse_root(tab.path).root_text);
     case #char "@";
         change_dir(app, app.start_dir);
     case #char "-";
@@ -790,19 +844,22 @@ shell_quote :: (text: str) -> str {
 /// Runs a shell command line in the current directory. A foreground program
 /// gets the terminal: the session is suspended and restored around it.
 run_external :: (app: *App, line: str, background: bool) {
-    tab := current_tab(app);
     if !app.have_session {
         set_message(app, tprint("would run: {}", line));
         return;
     }
+    #pattern ?directory := working_directory_path(current_tab(app).path) else {
+        set_message(app, WORKING_DIRECTORY_ERROR, true);
+        return;
+    };
     if background {
         full := tprint("{} >/dev/null 2>&1 &", line);
-        _ := run_shell_command(full, tab.path);
+        _ := run_shell_command(full, directory);
         set_message(app, tprint("opened with: {}", line));
         return;
     }
     end_session(app);
-    result := run_shell_command(line, tab.path);
+    result := run_shell_command(line, directory);
     if !begin_session(app) {
         app.quit = true;
         return;
@@ -954,65 +1011,59 @@ submit_prompt :: (app: *App, kind: Prompt_Kind, text: str) {
         #pattern ?e := current_entry(app) else {
             return;
         };
-        if text.contains("/") {
-            set_message(app, "a name cannot contain '/'", true);
+        if text == e.name return;
+        if Paths.filename(text) != text || text == "." || text == ".." {
+            set_message(app, "enter a name in the current directory", true);
             return;
         }
-        target := tprint("{}/{}", tab.path, text);
-        if exists(target).unwrap_or(false) {
-            set_message(app, tprint("{} already exists", text), true);
-            return;
-        }
+        target := join_path(tab.path, text);
+        defer target.free();
         if rename(e.path, target, false) == {
         case .Ok;
             set_message(app, tprint("renamed to {}", text));
             load_current(app, text);
         case .Err(error);
-            set_message(app, tprint("rename failed: {}", os_error_text(error.os_code)), true);
+            if error.kind == .Already_Exists set_message(app, tprint("{} already exists", text), true);
+            else set_message(app, tprint("rename failed: {}", os_error_text(error.os_code)), true);
         }
     case .Create;
-        directory := text[text.count - 1] == #char "/";
-        name := text.trim_end_matches("/");
-        target := tprint("{}/{}", tab.path, name);
-        if exists(target).unwrap_or(false) {
-            set_message(app, tprint("{} already exists", name), true);
+        #if OUT.os == .Windows if Paths.path_parse_root(text).kind != .Relative {
+            set_message(app, "enter a path relative to the current directory", true);
             return;
         }
-        ok := true;
-        if directory {
-            if create_directory(target, .Default_Directory, true) == {
-            case .Err(error);
-                ok = false;
-                set_message(app, tprint("mkdir failed: {}", os_error_text(error.os_code)), true);
-            else;
-            }
-        } else {
-            parent := parent_path(target);
-            _ := create_directory(parent, .Default_Directory, true);
-            if write_file(target, "") == {
-            case .Err(error);
-                ok = false;
-                set_message(app, tprint("create failed: {}", os_error_text(error.os_code)), true);
-            else;
-            }
+        start: ssize = 0;
+        end := text.count;
+        while start < end && Paths.path_is_separator(text[start]) start += 1;
+        while end > start && Paths.path_is_separator(text[end - 1]) end -= 1;
+        if start == end {
+            set_message(app, "enter a file or directory name", true);
+            return;
         }
-        if ok {
+        name := text[start..end];
+        directory := end < text.count;
+        target := resolve_browser_path(tab.path, name);
+        defer target.free();
+        if create_browser_entry(target, directory) == {
+        case .Err(error);
+            if error.kind == .Already_Exists set_message(app, tprint("{} already exists", name), true);
+            else {
+                action := ifx directory "mkdir" else "create";
+                set_message(app, tprint("{} failed: {}", action, os_error_text(error.os_code)), true);
+            }
+        case .Ok;
             set_message(app, tprint("created {}", text));
-            first := name;
-            if #pattern ?split = name.split_once("/") first = split.before;
-            load_current(app, first);
+            first_end: ssize = 0;
+            while first_end < name.count && !Paths.path_is_separator(name[first_end]) first_end += 1;
+            load_current(app, name[..first_end]);
         }
     case .Change_Dir;
         #pattern ?path := Home.resolve(text, context.temp_allocator) else {
             set_message(app, Home.unavailable(), true);
             return;
         };
-        if Paths.path_is_rooted(path) change_dir(app, path);
-        else {
-            joined := join_path(tab.path, path);
-            defer joined.free();
-            change_dir(app, joined);
-        }
+        joined := resolve_browser_path(tab.path, path);
+        defer joined.free();
+        change_dir(app, joined);
     case .Open_With;
         #pattern ?e := current_entry(app) else {
             return;
@@ -1024,6 +1075,15 @@ submit_prompt :: (app: *App, kind: Prompt_Kind, text: str) {
 
 // ---------------------------------------------------------------------------
 // File operations.
+
+create_browser_entry :: (path: str, directory: bool) -> Fs_Error!void {
+    _ := create_directory(parent_path(path), .make_parent = true)?;
+    if directory return create_directory(path);
+    file := File.open(path, .Write, .Create_New)?;
+    defer file.free();
+    _ := file.close()?;
+    return .Ok;
+}
 
 File_Status :: struct {
     app: *App;
@@ -1293,9 +1353,10 @@ display_path :: (app: *App, path: str) -> str {
     if app.home.count > 1 && path.starts_with(app.home) {
         rest := path[app.home.count..path.count];
         if rest.count == 0 return "~";
-        if rest[0] == #char "/" return tprint("~{}", rest);
+        if Paths.path_is_separator(rest[0]) return tprint("~{}", rest);
+        if Paths.path_is_separator(app.home[app.home.count - 1]) return tprint("~{}", path[app.home.count - 1..]);
     }
-    return path;
+    return conventional_path(path);
 }
 
 draw_header :: (app: *App, canvas: *Terminal_Canvas) {
@@ -1749,7 +1810,7 @@ HELP_LINES: []str = .[
     "  p  copy selection here      v  move selection here",
     "  x  delete (selection or current)      r  rename      n  new file/dir/",
     "  e  edit in $EDITOR   o  open with...   !  shell here",
-    "  q  quit (writes --cd-file)   Q  quit without writing   ? help",
+    "  q  quit and cd here         Q  quit and keep original directory   ? help",
     "MOUSE",
     "  click selects, double-click opens, right-click marks, wheel scrolls",
 ];

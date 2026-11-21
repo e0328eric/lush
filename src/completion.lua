@@ -176,6 +176,7 @@ local function file_candidates(prefix, directories_only, executables_only)
     local query = directory ~= "" and directory or "."
     local ok, entries = pcall(function() return native.list(path_arg(query), true) end)
     if not ok or type(entries) ~= "table" then return {} end
+    local directory_suffix = native.platform == "windows" and directory:sub(1, 4) == [[\\?\]] and "\\" or "/"
     local result = {}
     for _, entry in ipairs(entries) do
         local name, kind = entry.name, entry.type or entry.kind
@@ -183,8 +184,8 @@ local function file_candidates(prefix, directories_only, executables_only)
         if type(name) == "string" and name ~= "." and name ~= ".." and starts_with(name, fragment) and
             (not directories_only or is_directory) and
             (not executables_only or is_directory or entry.executable) then
-            result[#result + 1] = {value = directory .. name .. (is_directory and "/" or ""),
-                                  label = name .. (is_directory and "/" or "")}
+            local label = name .. (is_directory and directory_suffix or "")
+            result[#result + 1] = {value = directory .. label, label = label}
         end
     end
     table.sort(result, function(a, b) return a.value < b.value end)

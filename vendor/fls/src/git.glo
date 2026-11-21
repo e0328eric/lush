@@ -5,7 +5,9 @@
 #import "Format";
 #import "Strings";
 #import "Process/Run";
+#import "File_System/Metadata";
 #import "File_System/System";
+Paths :: #import "File_System/Path";
 #import "util.glo";
 
 #public {
@@ -20,6 +22,8 @@ Git_File :: struct {
 Git_Repo :: struct {
     /// Canonical path of the work tree root.
     root: str;
+    /// Most recently queried directory in this work tree.
+    directory: str;
     files: [..]Git_File;
 }
 
@@ -35,6 +39,7 @@ Git_Repo ::: instance Freeable {
     free :: (x: *Git_Repo) {
         defer free_fields(x);
         free_string(&x.root);
+        free_string(&x.directory);
     }
 }
 
@@ -53,6 +58,33 @@ not_repos: [..]str;
     not_repos = empty_paths;
 }
 
+// Both paths are canonical, and the suffix must start on a component boundary.
+relative_to_root :: (path: str, root: str) -> ?str {
+    if root.count == 0 || !path.starts_with(root) return null;
+    tail := path[root.count..];
+    if tail.count == 0 || Paths.path_is_separator(root[root.count - 1]) return ?tail;
+    if !Paths.path_is_separator(tail[0]) return null;
+    return ?tail[1..];
+}
+
+cached_directory :: (repo: *Git_Repo, directory: str) -> bool {
+    if directory == repo.root || directory == repo.directory return true;
+    if relative_to_root(directory, repo.root) == null return false;
+    // Reuse the outer status unless a .git marker or a possible bare
+    // repository (HEAD) requires Git to discover the work tree again.
+    parent := directory;
+    while parent.count > repo.root.count && parent != repo.directory {
+        for name: .[".git", "HEAD"] {
+            marker := join_path(parent, name);
+            defer marker.free();
+            if exists(marker).unwrap_or(true) return false;
+        }
+        parent = parent_path(parent);
+    }
+    set_string(&repo.directory, directory);
+    return true;
+}
+
 #public {
 
 /// The repository containing `directory`, loaded once and cached.
@@ -63,7 +95,7 @@ git_repo_for :: (directory: str) -> ?*Git_Repo {
     defer absolute_dir.free();
     for i: 0..repos.count {
         r := &repos[i];
-        if absolute_dir == r.root || absolute_dir.starts_with(tprint("{}/", r.root)) return r;
+        if cached_directory(r, absolute_dir) return r;
     }
     for path: not_repos if path == absolute_dir return null;
 
@@ -91,6 +123,12 @@ git_repo_for :: (directory: str) -> ?*Git_Repo {
         case .Ok(resolved); repo.root = resolved;
         case .Err; repo.root = root.clone();
         }
+        for *cached: repos if cached.root == repo.root {
+            repo.root.free();
+            set_string(&cached.directory, absolute_dir);
+            return cached;
+        }
+        repo.directory = absolute_dir.clone();
         load_status(&repo);
         repos.push(repo);
         return &repos[repos.count - 1];
@@ -109,11 +147,9 @@ git_status_of :: (repo: *Git_Repo, path: str, is_dir: bool) -> (u8, u8) {
         absolute_path = join_path(parent, base_name(path));
     }
     defer absolute_path.free();
-    if absolute_path.count < repo.root.count return 0, 0;
-    relative := "";
-    if absolute_path.count > repo.root.count {
-        relative = absolute_path[repo.root.count + 1..absolute_path.count];
-    }
+    #pattern ?relative := relative_to_root(absolute_path, repo.root) else { return 0, 0; };
+    // Git porcelain always uses forward slashes, including on Windows.
+    #if OUT.os == .Windows relative = relative.replace("\\", "/", .allocator = context.temp_allocator);
     x: u8 = #char "-";
     y: u8 = #char "-";
     dir_prefix := tprint("{}/", relative);

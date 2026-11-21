@@ -536,6 +536,8 @@ animate :: (session: *Terminal_Session, mode: Lol_Mode) -> s32 {
     started := false;
     next := now_ms();
     while !scene.done {
+        mark := temp_mark();
+        defer temp_rewind(mark);
         width: ssize = 80;
         height: ssize = 24;
         if session.size() == {
@@ -557,7 +559,6 @@ animate :: (session: *Terminal_Session, mode: Lol_Mode) -> s32 {
             break;
         else;
         }
-        reset_temporary_storage();
         scene_step(&scene);
         next += FRAME_MS;
         if wait_frame(session, next, mode) break;
@@ -579,6 +580,8 @@ lol_snapshot :: (width: ssize, height: ssize) -> s32 {
     out: String_Builder;
     defer out.free();
     while !scene.done {
+        mark := temp_mark();
+        defer temp_rewind(mark);
         scene_draw(&scene, &canvas);
         out.write_string(tprint("--- frame {} ---\n", scene.frame));
         for y: 0..canvas.height {
@@ -592,7 +595,6 @@ lol_snapshot :: (width: ssize, height: ssize) -> s32 {
             out.truncate(end);
             out.write_byte(10);
         }
-        reset_temporary_storage();
         scene_step(&scene);
     }
     print("{}", out.to_string());

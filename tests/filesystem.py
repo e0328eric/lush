@@ -441,6 +441,18 @@ def main():
         absolute_child = str(directory / 'absolute-child')
         suite.check(f"assert(path.join('discarded', {lua_string(absolute_child)}) == "
                     f"{lua_string(os.path.normpath(absolute_child))})", '')
+        if os.name == 'nt':
+            verbatim = '\\\\?\\' + str(directory)
+            suite.check(f"local base = {lua_string(verbatim)}; " + r"""
+                local child = path.join('discarded', base, 'tree', 'sub/data.txt')
+                assert(child == base .. [[\tree\sub\data.txt]] and exists(child), child)
+                local share = [[\\?\UNC\server\share]]
+                assert(path.join(share, 'a/b', '/root/leaf') == share .. [[\root\leaf]])
+                local explicit = [[\\?\C:\exact/bytes]]
+                assert(path.join(base, explicit) == explicit)
+                local device = '//?/C:/ordinary/../safe'
+                assert(path.join(base, device) == [[\\.\C:\safe]])
+                """, '')
         result = suite.check("print(path.expand('.'))")
         assert Path(result.stdout.strip()).is_absolute()
         assert Path(result.stdout.strip()).resolve() == directory.resolve()

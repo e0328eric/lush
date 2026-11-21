@@ -244,6 +244,42 @@ join_path :: (dir: str, name: str) -> str {
     return format("{}/{}", dir, name);
 }
 
+/// Resolves a path typed in a browser prompt against its tab. The caller frees it.
+resolve_browser_path :: (dir: str, input: str) -> str {
+    #if OUT.os == .Windows {
+        base := Paths.path_parse_root(dir);
+        part := Paths.path_parse_root(input);
+        if part.verbatim || part.absolute || part.kind == .Windows_Unc return input.clone();
+        if !base.verbatim return Paths.path_join(dir, input);
+
+        if part.kind == .Windows_Drive_Relative {
+            if base.kind != .Windows_Verbatim_Drive || lower_byte(dir[4]) != lower_byte(input[0])
+                return input.clone();
+            input = input[part.rest_start..];
+        }
+        // Normalize the ordinary user input underneath a temporary root. This
+        // gives both separators and dot components their usual meaning while
+        // preserving the exact drive, share or device name of the tab.
+        below_root := tprint("\\{}", dir[base.rest_start..]);
+        joined := Paths.path_join(below_root, input, .allocator = context.temp_allocator);
+        if base.root_text.ends_with("\\") return format("{}{}", base.root_text, joined[1..]);
+        return format("{}{}", base.root_text, joined);
+    }
+    if Paths.path_is_rooted(input) return input.clone();
+    return join_path(dir, input);
+}
+
+/// Conventional spelling for display and for programs that consume ordinary
+/// Windows paths. The result borrows the path or temporary storage.
+conventional_path :: (path: str) -> str {
+    #if OUT.os == .Windows if Paths.path_parse_root(path).kind == {
+    case .Windows_Verbatim_Drive; return path[4..];
+    case .Windows_Verbatim_Unc; return tprint("\\\\{}", path[8..]);
+    else;
+    }
+    return path;
+}
+
 /// Lowercased extension of `name` without the dot, as a temporary string;
 /// empty when there is none. As in eza, a dotfile's name after the dot
 /// counts as its extension.

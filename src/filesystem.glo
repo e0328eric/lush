@@ -169,10 +169,21 @@ native_path :: (state: *void) -> s32 {
     if operation == "join" {
         parts: [..]str;
         defer parts.free();
+        verbatim_base := false;
         for i: 2..=Lua.get_top(state) {
             if Lua.value_type(state, cast(s32) i) != 4 || Lua.text(state, cast(s32) i).has_nul()
                 return failure(state, "path.join: expected path strings without NUL");
-            parts.push(Lua.text(state, cast(s32) i));
+            part := Lua.text(state, cast(s32) i);
+            #if OUT.os == .Windows {
+                root := path_parse_root(part);
+                if root.kind == .Relative || root.kind == .Windows_Rooted_No_Drive {
+                    // These operands inherit the existing volume. Convert their
+                    // ordinary separators before joining them to a verbatim base.
+                    if verbatim_base && part.contains("/")
+                        part = part.replace("/", "\\", .allocator = context.temp_allocator);
+                } else verbatim_base = root.verbatim;
+            }
+            parts.push(part);
         }
         joined := path_join_parts(parts.view());
         defer joined.free();

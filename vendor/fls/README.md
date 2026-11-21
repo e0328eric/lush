@@ -35,9 +35,10 @@ The snapshot has adaptations for a persistent shell process:
   it on exit. Both interactive views use Lush's `src/screen.glo` helper, which
   mirrors cursor visibility to ConPTY hosts in the VT output stream.
 
-The adapter supplies an isolated scratch allocator. Upstream's existing
-per-directory and per-frame resets clear that arena while preserving the
-shell's temporary strings. Cleanup and restoration run on every return path.
+The adapter uses Glosso's native temporary arena for both formatting and
+filesystem calls. Each browser event, snapshot frame and animation frame
+rewinds to its own starting mark. Listings also rewind between directories.
+Returning to the shell restores the mark and allocator from before the call.
 
 Original source SHA-256 digests before these adaptations:
 

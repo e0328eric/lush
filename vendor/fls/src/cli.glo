@@ -11,6 +11,7 @@
 #import "File_System/Types";
 #import "File_System/System";
 #import "File_System/Metadata";
+Paths :: #import "File_System/Path";
 #import "Process/Environment";
 #import "Memory/Ownership";
 #import "util.glo";
@@ -203,9 +204,11 @@ list_arguments :: (r: *Render) {
 /// Lists one directory under `header` (when not empty).
 list_directory :: (r: *Render, path: str, depth: s64, header: str) {
     options := r.options;
+    mark := temp_mark();
     loaded := load_directory(path, &options.filter);
     #pattern .Ok(found) := loaded else {
         if #pattern .Err(error) = loaded report_unreadable(r, path, error.os_code);
+        temp_rewind(mark);
         return;
     };
     entries := found;
@@ -220,7 +223,7 @@ list_directory :: (r: *Render, path: str, depth: s64, header: str) {
     apply_total_sizes(r, entries[..]);
     render_listing(r, entries[..]);
     flush_output();
-    reset_temporary_storage();
+    temp_rewind(mark);
     if !options.recurse return;
     if options.level >= 0 && depth >= options.level return;
     for *e: entries {
@@ -362,6 +365,30 @@ percent_encode :: (b: *String_Builder, text: str) {
     }
 }
 
+begin_file_link :: (b: *String_Builder, path: str) -> bool {
+    #pattern .Ok(full) := absolute(path, context.temp_allocator) else { return false; };
+    #if OUT.os == .Windows {
+        ordinary := conventional_path(full);
+        root := Paths.path_parse_root(ordinary);
+        url_path := Paths.path_convert_separators(ordinary, .Windows, .Posix, context.temp_allocator);
+        if root.kind == {
+        case .Windows_Drive_Absolute;
+            b.write_string("\x1b]8;;file:///");
+            b.write_string(url_path[..2]); // Keep the drive letter and colon.
+            percent_encode(b, url_path[2..]);
+        case .Windows_Unc;
+            b.write_string("\x1b]8;;file://");
+            percent_encode(b, url_path[2..]); // The UNC server is the URI host.
+        else; return false;
+        }
+    } else {
+        b.write_string("\x1b]8;;file://");
+        percent_encode(b, full);
+    }
+    b.write_string("\x1b\\");
+    return true;
+}
+
 /// The name column for an entry: icon, colored name, classify indicator and,
 /// with `link_target`, the symbolic link's destination.
 name_cell :: (r: *Render, e: *const Entry, link_target: bool) -> Cell {
@@ -386,20 +413,15 @@ name_cell :: (r: *Render, e: *const Entry, link_target: bool) -> Cell {
     // A path given as an argument shows its directory part in cyan.
     name := e.name;
     cut := name.count;
-    while cut > 0 && name[cut - 1] != #char "/" cut -= 1;
+    while cut > 0 && !Paths.path_is_separator(name[cut - 1]) cut -= 1;
     if cut > 0 && cut < name.count {
         write_styled(&b, name[0..cut], theme.link_path, r.color);
         width += text_width(name[0..cut]);
         name = name[cut..name.count];
     }
-    if r.hyperlink {
-        b.write_string("\x1b]8;;file://");
-        full := absolute(e.path, context.temp_allocator).unwrap_or(e.path);
-        percent_encode(&b, full);
-        b.write_string("\x1b\\");
-    }
+    linked := r.hyperlink && begin_file_link(&b, e.path);
     width += write_name_text(r, &b, name, style);
-    if r.hyperlink b.write_string("\x1b]8;;\x1b\\");
+    if linked b.write_string("\x1b]8;;\x1b\\");
     if r.classify && !(link_target && e.meta.kind == .Symlink) {
         suffix := classify_suffix(e);
         b.write_string(suffix);
@@ -447,7 +469,7 @@ write_link_target :: (r: *Render, b: *String_Builder, e: *const Entry) -> ssize 
     }
     // The directory part in the link-path color, the last part by type.
     cut := target.count;
-    while cut > 0 && target[cut - 1] != #char "/" cut -= 1;
+    while cut > 0 && !Paths.path_is_separator(target[cut - 1]) cut -= 1;
     width: ssize = 0;
     if cut > 0 {
         write_styled(b, target[0..cut], theme.link_path, r.color);
@@ -932,6 +954,8 @@ tree_prefix_cell :: (r: *Render, prefix: str) -> Cell {
 }
 
 render_tree :: (r: *Render, root: *Entry) {
+    mark := temp_mark();
+    defer temp_rewind(mark);
     // `entries` owns every row's entry; `prefixes` live in temporary storage.
     entries: [..]Entry;
     defer free(&entries);
@@ -957,7 +981,6 @@ render_tree :: (r: *Render, root: *Entry) {
         }
     }
     flush_output();
-    reset_temporary_storage();
 }
 
 collect_tree :: (

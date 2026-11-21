@@ -144,6 +144,15 @@ local ok, problem = xpcall(function()
     completion_visible_global, completion_safe_table = nil, nil
 
     native.platform = "windows"
+    local function open_prefix(path)
+        return "open(" .. string.format("%q", path):sub(1, -2)
+    end
+    for _, base in ipairs({[[\\?\C:\tools\]], [[\\?\UNC\server\share\]]}) do
+        directories[base] = {{name = "nested", type = "dir"}}
+        directories[base .. [[nested\]]] = {{name = "child.txt", type = "file"}}
+        contains(open_prefix(base .. "ne"), open_prefix(base .. [[nested\]]))
+        contains(open_prefix(base .. [[nested\chi]]), open_prefix(base .. [[nested\child.txt]]))
+    end
     contains("cmd.gi", "cmd.GitUI")
     contains('open("AL', 'open("alpha.txt')
     contains('cat("AL', 'cat("alpha.txt')

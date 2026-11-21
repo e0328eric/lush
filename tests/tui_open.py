@@ -2,7 +2,7 @@
 """Check Windows TUI default opening without launching user applications.
 
 Run: python tests/tui_open.py --exe build/lush.exe
-Snapshots test opener selection; a hidden ConPTY tests a deleted file's error.
+Snapshots test opener selection; a hidden ConPTY tests opening and quitting in a subdirectory.
 """
 
 from __future__ import annotations
@@ -27,7 +27,8 @@ def check(executable: Path) -> None:
 
         def snapshot(keys="<Enter>", **overrides):
             arguments = ["--snapshot", "--keys", keys, "--width", "240", str(directory)]
-            code = "show(ls(" + ",".join(lua_string(arg) for arg in arguments) + "))"
+            listing = "show(ls(" + ",".join(lua_string(arg) for arg in arguments) + "))"
+            code = "local before = pwd(); " + listing + "; assert(pwd() == before)"
             result = subprocess.run([str(executable), "--no-config", "-c", code],
                                     cwd=directory, env=environment | overrides,
                                     capture_output=True, text=True, encoding="utf-8", timeout=20)
@@ -50,10 +51,9 @@ def check(executable: Path) -> None:
         assert nested.name in output and "would open:" not in output and "would run:" not in output, output
         output = snapshot("/subdirectory<Enter>h")
         assert target.name in output and child.name in output and "would open:" not in output, output
-        nested.unlink()
-        child.rmdir()
 
-        code = "show(ls('--tui'," + lua_string(directory) + "))"
+        expected = lua_string(child.as_posix())
+        code = f"show(ls('--tui')); assert(pwd():lower() == string.lower({expected}), pwd())"
         terminal = Pseudoconsole(executable, code, 180, 30, environment=environment, cwd=directory)
         transcript = bytearray()
 
@@ -67,22 +67,24 @@ def check(executable: Path) -> None:
             raise AssertionError((description, bytes(transcript[-2000:])))
 
         try:
-            until(lambda: b"1/1" in transcript, "initial file listing missing")
+            until(lambda: b"1/2" in transcript, "initial file listing missing")
+            terminal.send(b"\r")
+            until(lambda: b"1/1" in transcript, "did not enter the subdirectory")
             # Keep the cached entry selected until Enter. Restoring the directory
             # timestamp prevents the idle refresh from discarding the removed file.
-            timestamps = directory.stat()
-            target.unlink()
-            os.utime(directory, ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns))
+            timestamps = child.stat()
+            nested.unlink()
+            os.utime(child, ns=(timestamps.st_atime_ns, timestamps.st_mtime_ns))
             terminal.send(b"\r")
             until(lambda: b"open: " in transcript, "native opener failure missing")
             assert b"Win32 error" in transcript or b"shell error" in transcript, bytes(transcript[-2000:])
             assert b"xdg-open" not in transcript, bytes(transcript[-2000:])
             terminal.send(b"q")
             until(lambda: terminal.poll() is not None, "browser did not exit after opener failure")
-            assert terminal.poll() == 0
+            assert terminal.poll() == 0, bytes(transcript[-2000:])
         finally:
             terminal.close()
-    print("TUI opener checks passed: Windows default, override precedence, navigation and native errors")
+    print("TUI checks passed: Windows default opener, override precedence, native errors and cwd on quit")
 
 
 def main():

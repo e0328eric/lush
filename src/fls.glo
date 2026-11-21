@@ -3,7 +3,6 @@
 #import "Format";
 #import "Strings/Utf8";
 #import "Context";
-#import "Memory/Arena";
 #import "Memory/Ownership";
 #import "Terminal";
 #import "File_System/File";
@@ -17,24 +16,6 @@ Git :: #import "../vendor/fls/src/git.glo";
 Util :: #import "../vendor/fls/src/util.glo";
 Tui :: #import "../vendor/fls/src/tui.glo";
 Lol :: #import "../vendor/fls/src/lol.glo";
-
-// Upstream resets its scratch storage between directories/animation frames.
-// Give each invocation its own arena so these resets preserve host temporaries.
-scratch_allocate :: (
-    data: ?*void, mode: Allocator_Mode, size: ssize, alignment: ssize,
-    old_memory: ?*void, old_size: ssize
-) -> ?*void {
-    #pattern ?pointer := data else { return null; };
-    arena := cast(*Arena) pointer;
-    if mode == .Free_All { arena.clear(); return null; }
-    base := arena.allocator();
-    #pattern ?procedure := base.procedure else { return null; };
-    return procedure(base.data, mode, size, alignment, old_memory, old_size);
-}
-
-scratch_allocator :: (arena: *Arena) -> Allocator {
-    return .{ .procedure = scratch_allocate, .data = cast(*void) arena };
-}
 
 reset_globals :: () {
     Theme.reset_theme();
@@ -56,10 +37,12 @@ valid_arguments :: (args: []const str) -> bool {
 
 // Arguments exclude an executable name, exactly as ls("-l", "path").
 run :: (args: []const str) -> s32 {
-    arena := Arena.new();
-    defer arena.free();
+    // Native filesystem calls use the thread's temp arena for path conversions.
+    // Share it with formatting so each frame can release both at its own mark.
+    mark := temp_mark();
+    defer temp_rewind(mark);
     previous_scratch := context.temp_allocator;
-    context.temp_allocator = scratch_allocator(&arena);
+    context.temp_allocator = default_temp_allocator();
     defer context.temp_allocator = previous_scratch;
     defer reset_globals();
     options: Options.Options;
@@ -113,10 +96,10 @@ release_records :: (list: *Record_List) {
 }
 
 records :: (args: []const str) -> Record_List {
-    arena := Arena.new();
-    defer arena.free();
+    mark := temp_mark();
+    defer temp_rewind(mark);
     previous_scratch := context.temp_allocator;
-    context.temp_allocator = scratch_allocator(&arena);
+    context.temp_allocator = default_temp_allocator();
     defer context.temp_allocator = previous_scratch;
     defer reset_globals();
     result: Record_List;

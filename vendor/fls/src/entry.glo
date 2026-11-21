@@ -210,7 +210,7 @@ classify_suffix :: (e: *const Entry) -> str {
 entry_icon :: (e: *const Entry) -> str {
     // A link to a directory gets the (non-empty) directory icon, as in eza.
     dir := e.is_dir;
-    empty := dir && e.meta.kind == .Directory && is_empty(e.path).unwrap_or(false);
+    empty := dir && e.meta.kind == .Directory && directory_is_empty(e.path).unwrap_or(false);
     return icon_for(e.name, e.class, dir, empty);
 }
 
@@ -315,6 +315,15 @@ entry_size :: (e: *const Entry) -> s64 {
     return e.meta.size;
 }
 
+}
+
+// Only the first child matters when choosing the directory icon.
+directory_is_empty :: (path: str) -> Fs_Error!bool {
+    cursor := Directory.open_directory(path)?;
+    first := cursor.next();
+    _ := cursor.close()?;
+    child := first?;
+    return .Ok(child == null);
 }
 
 #public compare_field :: (field: Sort_Field, a: Entry, b: Entry) -> Ordering {
