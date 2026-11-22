@@ -12,6 +12,7 @@ field :: (state: *void, table: s32, name: str) -> s32 {
 }
 
 #public {
+
 Settings :: struct {
     path: str;
     limit: ssize = 1000;
@@ -72,7 +73,9 @@ load :: (state: *void, startup_directory: str, default_history: str) -> Settings
         anchored := path_join(startup_directory, settings.path);
         defer anchored.free();
         if absolute(anchored) == {
-        case .Ok(path); settings.path.free(); settings.path = path;
+        case .Ok(path);
+            settings.path.free();
+            settings.path = path;
         case .Err(error);
             settings.error = tprint("history path: {}", error.kind.reason()).clone();
             return settings;
@@ -89,15 +92,18 @@ load :: (state: *void, startup_directory: str, default_history: str) -> Settings
     }
     Lua.pop(state);
     kind = field(state, table, "autosuggestions");
-    if kind == 1 settings.autosuggestions = Lua.to_boolean(state, -1) != 0;
+    if kind == 1
+        settings.autosuggestions = Lua.to_boolean(state, -1) != 0;
     else if kind != 0
         settings.error = "lush.config.autosuggestions must be a boolean".clone();
     if settings.error.count > 0 return settings;
     Lua.pop(state);
     kind = field(state, table, "syntax_highlighting");
-    if kind == 1 settings.syntax_highlighting = Lua.to_boolean(state, -1) != 0;
+    if kind == 1
+        settings.syntax_highlighting = Lua.to_boolean(state, -1) != 0;
     else if kind != 0
         settings.error = "lush.config.syntax_highlighting must be a boolean".clone();
     return settings;
 }
+
 }

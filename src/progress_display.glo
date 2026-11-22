@@ -9,10 +9,12 @@ Util :: #import "../vendor/fls/src/util.glo";
 #import "Context";
 
 #public {
+
 Timing :: struct {
     last_ns: s64;
     visible: bool;
 }
+
 }
 
 Timing ::: #public {
@@ -21,7 +23,9 @@ Timing ::: #public {
     }
 
     ready :: (*#self) -> bool {
-        #pattern .Ok(now) := Clock.Monotonic.now() else { return false; };
+        #pattern .Ok(now) := Clock.Monotonic.now() else {
+            return false;
+        };
         delay := ifx #self.visible 80_000_000 else 250_000_000;
         if now.nanoseconds - #self.last_ns < delay return false;
         #self.last_ns = now.nanoseconds;
@@ -44,13 +48,14 @@ with_entry_count :: (label: str, entries: s64, columns: ssize) -> str {
 }
 
 #public {
+
 copy_label :: (done: s64, total: s64, complete: bool, columns: ssize, entries: s64 = -1) -> str {
     if !complete && total == -1 return entries_label("Scanning", done, columns);
     if !complete && total == -3 return entries_label("Copied", done, columns);
     if !complete && total < 0 {
         amount := copy_bytes(done);
         label := Fmt.tprint("Copying {}", amount);
-        if label.count <= columns return with_entry_count(label, entries, columns);
+        if label.count <= columns  return with_entry_count(label, entries, columns);
         if amount.count <= columns return amount;
         return "";
     }
@@ -60,23 +65,23 @@ copy_label :: (done: s64, total: s64, complete: bool, columns: ssize, entries: s
     else if total > 0 {
         // Reserve 100% until the native copy has closed the file and applied metadata.
         if done >= total percent = 99;
-        else percent = cast(s64) (cast(s128) done * 100 / cast(s128) total);
+        else             percent = cast(s64)(cast(s128) done * 100 / cast(s128) total);
     }
     label := Fmt.tprint("{}%", percent);
     if !complete && done > 0 && percent == 0 label = "<1%";
-    if columns < label.count return "";
-    if columns < 12 return label;
+    if columns < label.count                 return "";
+    if columns < 12                          return label;
     if !complete && total > 0 {
         transferred := Fmt.tprint("{}  {}", label, copy_bytes(done));
         amounts := Fmt.tprint("{} / {}", transferred, copy_bytes(total));
-        if 8 + amounts.count <= columns label = amounts;
+        if      8 + amounts.count <= columns     label = amounts;
         else if 8 + transferred.count <= columns label = transferred;
         label = with_entry_count(label, entries, columns - 8);
     }
     filled := "########################";
     empty := "------------------------";
     width := columns - 11 - label.count; // "Copying [" + "] " + label
-    if width < 3 return Fmt.tprint("Copying {}", label);
+    if width < 3            return Fmt.tprint("Copying {}", label);
     if width > filled.count width = filled.count;
     cells := width * cast(ssize) percent / 100;
     return Fmt.tprint("Copying [{}{}] {}", filled[..cells], empty[..(width - cells)], label);
@@ -100,6 +105,7 @@ Terminal_Bar :: struct {
     interactive: bool;
     timing: Timing;
 }
+
 }
 
 Terminal_Bar ::: #public {
@@ -120,7 +126,7 @@ paint :: (bar: *Terminal_Bar, line: str, completed: bool = false) {
     frame.write_string("\r");
     frame.write_string(line);
     if bar.painted > line.count frame.write_repeated_byte(32, bar.painted - line.count);
-    if completed frame.write_string("\r\n");
+    if      completed       frame.write_string("\r\n");
     else if line.count == 0 frame.write_string("\r");
     _ := bar.stream.write(frame.to_string());
     bar.painted = line.count;
@@ -135,6 +141,7 @@ show_count :: (state: *void, verb: str, count: s64) {
 }
 
 #public {
+
 update :: (state: *void, done: s64, total: s64, entries: s64) {
     bar := cast(*Terminal_Bar) state;
     if !bar.interactive || !bar.timing.ready() return;
@@ -158,12 +165,13 @@ clear :: (bar: *Terminal_Bar) {
 finish_copy :: (bar: *Terminal_Bar, success: bool) {
     if bar.painted == 0 return;
     if success paint(bar, copy_label(0, 0, true, bar.columns), true);
-    else clear(bar);
+    else       clear(bar);
 }
 
 finish_delete :: (bar: *Terminal_Bar, count: s64, success: bool) {
     if bar.painted == 0 return;
     if success paint(bar, entries_label("Deleted", count, bar.columns), true);
-    else clear(bar);
+    else       clear(bar);
 }
+
 }

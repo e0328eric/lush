@@ -21,7 +21,8 @@ Opener :: #import "opener.glo";
 theme_source :: (name: str) -> str {
     filename := path_join(path_dirname(#source_location.filename), name);
     if read_file(filename) == {
-    case .Ok(contents); return contents;
+    case .Ok(contents);
+        return contents;
     case .Err(error);
         print("could not embed theme isolation source {}: {}\n", name, error.kind.reason());
         exit(1);
@@ -31,16 +32,23 @@ THEME_LIBRARY :: #comptime theme_source("theme.lua");
 THEME_SANDBOX :: #comptime theme_source("theme_sandbox.lua");
 
 native_theme_compile :: (state: *void) -> s32 {
-    return Theme_VM.compile(state, THEME_LIBRARY.data, cast(usize) THEME_LIBRARY.count,
-        THEME_SANDBOX.data, cast(usize) THEME_SANDBOX.count);
+    return Theme_VM.compile(
+        state,
+        THEME_LIBRARY.data,
+        cast(usize) THEME_LIBRARY.count,
+        THEME_SANDBOX.data,
+        cast(usize) THEME_SANDBOX.count
+    );
 }
 native_theme_read :: (state: *void) -> s32 {
     if value_type(state, 1) != 4 return failure(state, "theme path must be a string");
     if read_file_up_to(text(state, 1), 256 * 1024 + 1) == {
-    case .Err(error); return fs_failure(state, error);
+    case .Err(error);
+        return fs_failure(state, error);
     case .Ok(contents);
         defer contents.free();
-        if contents.count > 256 * 1024 return failure(state, "theme source exceeds the 256 KiB limit");
+        if contents.count > 256 * 1024
+            return failure(state, "theme source exceeds the 256 KiB limit");
         push_text(state, contents);
         return 1;
     }
@@ -73,22 +81,30 @@ native_cwd :: (state: *void) -> s32 {
         defer path.free();
         push_text(state, path);
         return 1;
-    case .Err(error); return fs_failure(state, error);
+    case .Err(error);
+        return fs_failure(state, error);
     }
 }
 native_cd :: (state: *void) -> s32 {
     if value_type(state, 1) != 4 return failure(state, "cd: expected a path string");
     if set_current_directory(text(state, 1)) == {
-    case .Ok; push_boolean(state, 1); return 1;
-    case .Err(error); return fs_failure(state, error);
+    case .Ok;
+        push_boolean(state, 1);
+        return 1;
+    case .Err(error);
+        return fs_failure(state, error);
     }
 }
 file_kind :: (kind: File_Kind) -> str {
     if kind == {
-    case .Regular; return "file";
-    case .Directory; return "dir";
-    case .Symlink; return "symlink";
-    else; return "other";
+    case .Regular;
+        return "file";
+    case .Directory;
+        return "dir";
+    case .Symlink;
+        return "symlink";
+    else;
+        return "other";
     }
 }
 native_list :: (state: *void) -> s32 {
@@ -96,7 +112,8 @@ native_list :: (state: *void) -> s32 {
     path := text(state, 1);
     all := to_boolean(state, 2) != 0;
     if read_directory(path) == {
-    case .Err(error); return fs_failure(state, error);
+    case .Err(error);
+        return fs_failure(state, error);
     case .Ok(entries);
         defer entries.free();
         create_table(state, cast(s32) entries.entries.count, 0);
@@ -105,7 +122,9 @@ native_list :: (state: *void) -> s32 {
             full := path_join(path, entry.name);
             defer full.free();
             if metadata(full, false) == {
-            case .Err(error); pop(state); return fs_failure(state, error);
+            case .Err(error);
+                pop(state);
+                return fs_failure(state, error);
             case .Ok(info);
                 if !all && (entry.name.starts_with(".") || info.hidden) continue;
                 create_table(state, 0, 6);
@@ -114,8 +133,13 @@ native_list :: (state: *void) -> s32 {
                 text_field(state, "type", file_kind(info.kind));
                 text_field(state, "kind", file_kind(info.kind));
                 integer_field(state, "size", info.size);
-                boolean_field(state, "is_directory", info.kind == .Directory ||
-                    (info.kind == .Symlink && is_directory(full).unwrap_or(false)));
+                boolean_field(
+                    state,
+                    "is_directory",
+                    info.kind == .Directory || (
+                        info.kind == .Symlink && is_directory(full).unwrap_or(false)
+                    )
+                );
                 boolean_field(state, "executable", Executables.is_executable(full));
                 if info.modified.valid integer_field(state, "modified", info.modified.seconds);
                 index += 1;
@@ -128,7 +152,10 @@ native_list :: (state: *void) -> s32 {
 native_executables :: (state: *void) -> s32 {
     if value_type(state, 1) != 4 return failure(state, "completion: expected a prefix string");
     matches := Executables.candidates(text(state, 1));
-    defer { for name: matches name.free(); matches.free(); }
+    defer {
+        for name: matches name.free();
+        matches.free();
+    }
     create_table(state, cast(s32) matches.count, 0);
     for name, index: matches {
         push_text(state, name);
@@ -141,12 +168,13 @@ native_which :: (state: *void) -> s32 {
     path := Executables.resolve(text(state, 1));
     defer path.free();
     if path.count == 0 push_nil(state);
-    else push_text(state, path);
+    else               push_text(state, path);
     return 1;
 }
 native_clear :: (state: *void) -> s32 {
     if Terminal_Session.terminal_begin(.None) == {
-    case .Err; return failure(state, "clear requires an interactive terminal");
+    case .Err;
+        return failure(state, "clear requires an interactive terminal");
     case .Ok(session);
         defer session.free();
         defer session.end();
@@ -160,10 +188,16 @@ read_arguments :: (state: *void, index: s32, arguments: *[..]str) -> bool {
     count := cast(ssize) raw_length(state, index);
     for key: 1..=count {
         raw_get_integer(state, index, key);
-        if value_type(state, -1) != 4 { pop(state); return false; }
+        if value_type(state, -1) != 4 {
+            pop(state);
+            return false;
+        }
         argument := text(state, -1);
         for byte: argument.bytes() {
-            if byte == 0 { pop(state); return false; }
+            if byte == 0 {
+                pop(state);
+                return false;
+            }
         }
         arguments.push(argument);
         pop(state);
@@ -210,11 +244,15 @@ native_fls_records :: (state: *void) -> s32 {
 native_env_get :: (state: *void) -> s32 {
     if value_type(state, 1) != 4 return failure(state, "env: expected a variable name");
     if environment_get(text(state, 1)) == {
-    case .Err(error); return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
+    case .Err(error);
+        return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
     case .Ok(value);
         if value == {
-        case null; push_nil(state);
-        case ?entry; defer entry.free(); push_text(state, entry.value);
+        case null;
+            push_nil(state);
+        case ?entry;
+            defer entry.free();
+            push_text(state, entry.value);
         }
         return 1;
     }
@@ -224,21 +262,31 @@ native_env_set :: (state: *void) -> s32 {
     name := text(state, 1);
     if value_type(state, 2) == 0 {
         if environment_unset(name) == {
-        case .Err(error); return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
-        case .Ok; push_boolean(state, 1); return 1;
+        case .Err(error);
+            return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
+        case .Ok;
+            push_boolean(state, 1);
+            return 1;
         }
     }
     if value_type(state, 2) != 4 return failure(state, "env: expected a string or nil");
     if environment_set(name, text(state, 2)) == {
-    case .Err(error); return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
-    case .Ok; push_boolean(state, 1); return 1;
+    case .Err(error);
+        return failure(state, tprint("environment: {} (os {})", error.kind, error.os_code));
+    case .Ok;
+        push_boolean(state, 1);
+        return 1;
     }
 }
 native_read :: (state: *void) -> s32 {
     if value_type(state, 1) != 4 return failure(state, "read: expected a path string");
     if read_file(text(state, 1)) == {
-    case .Err(error); return fs_failure(state, error);
-    case .Ok(contents); defer contents.free(); push_text(state, contents); return 1;
+    case .Err(error);
+        return fs_failure(state, error);
+    case .Ok(contents);
+        defer contents.free();
+        push_text(state, contents);
+        return 1;
     }
 }
 native_write :: (state: *void) -> s32 {
@@ -248,22 +296,28 @@ native_write :: (state: *void) -> s32 {
     bytes := text(state, 2);
     if to_boolean(state, 3) == 0 {
         if write_file(path, bytes) == {
-        case .Err(error); return fs_failure(state, error);
-        case .Ok; push_boolean(state, 1); return 1;
+        case .Err(error);
+            return fs_failure(state, error);
+        case .Ok;
+            push_boolean(state, 1);
+            return 1;
         }
     }
     if File.open(path, .access = .Write, .disposition = .Open_Or_Create) == {
-    case .Err(error); return fs_failure(state, error);
+    case .Err(error);
+        return fs_failure(state, error);
     case .Ok(file);
         defer file.free();
         if file.seek(0, .End) == {
-        case .Err(error); return fs_failure(state, error);
+        case .Err(error);
+            return fs_failure(state, error);
         case .Ok;
         }
         remaining := bytes;
         while remaining.count > 0 {
             if file.write(remaining) == {
-            case .Err(error); return fs_failure(state, error);
+            case .Err(error);
+                return fs_failure(state, error);
             case .Ok(count);
                 if count == 0 return failure(state, "write: no progress");
                 remaining = remaining[count..];
@@ -302,8 +356,12 @@ native_execute :: (state: *void) -> s32 {
         commands.push(.{ .args = arguments.view() });
     }
     input := text(state, 2);
-    result := Process.execute(commands.view(), input, value_type(state, 2) == 4,
-        to_boolean(state, 3) != 0);
+    result := Process.execute(
+        commands.view(),
+        input,
+        value_type(state, 2) == 4,
+        to_boolean(state, 3) != 0
+    );
     defer Process.release(&result);
     create_table(state, 0, 7);
     boolean_field(state, "ok", result.code == 0 && result.error.count == 0);
@@ -313,7 +371,10 @@ native_execute :: (state: *void) -> s32 {
     text_field(state, "stderr", result.stderr);
     if result.error.count > 0 text_field(state, "error", result.error);
     create_table(state, cast(s32) result.statuses.count, 0);
-    for status, i: result.statuses { push_integer(state, status); raw_set_integer(state, -2, i + 1); }
+    for status, i: result.statuses {
+        push_integer(state, status);
+        raw_set_integer(state, -2, i + 1);
+    }
     set_field(state, -2, "statuses".data);
     return 1;
 }
@@ -328,28 +389,61 @@ native_exit :: (state: *void) -> s32 {
 
 // A C callback has no implicit Glosso context. Re-enter a normal Glosso
 // procedure before calling allocating standard-library operations.
-callback_cwd :: (state: *void) -> s32 #c_call { return native_cwd(state); }
-callback_cd :: (state: *void) -> s32 #c_call { return native_cd(state); }
-callback_list :: (state: *void) -> s32 #c_call { return native_list(state); }
-callback_env_get :: (state: *void) -> s32 #c_call { return native_env_get(state); }
-callback_env_set :: (state: *void) -> s32 #c_call { return native_env_set(state); }
-callback_read :: (state: *void) -> s32 #c_call { return native_read(state); }
-callback_theme_read :: (state: *void) -> s32 #c_call { return native_theme_read(state); }
-callback_theme_compile :: (state: *void) -> s32 #c_call { return native_theme_compile(state); }
-callback_write :: (state: *void) -> s32 #c_call { return native_write(state); }
-callback_execute :: (state: *void) -> s32 #c_call { return native_execute(state); }
-callback_exit :: (state: *void) -> s32 #c_call { return native_exit(state); }
-callback_executables :: (state: *void) -> s32 #c_call { return native_executables(state); }
-callback_which :: (state: *void) -> s32 #c_call { return native_which(state); }
-callback_clear :: (state: *void) -> s32 #c_call { return native_clear(state); }
-callback_fls :: (state: *void) -> s32 #c_call { return native_fls(state); }
-callback_fls_records :: (state: *void) -> s32 #c_call { return native_fls_records(state); }
+callback_cwd :: (state: *void) -> s32 #c_call {
+    return native_cwd(state);
+}
+callback_cd :: (state: *void) -> s32 #c_call {
+    return native_cd(state);
+}
+callback_list :: (state: *void) -> s32 #c_call {
+    return native_list(state);
+}
+callback_env_get :: (state: *void) -> s32 #c_call {
+    return native_env_get(state);
+}
+callback_env_set :: (state: *void) -> s32 #c_call {
+    return native_env_set(state);
+}
+callback_read :: (state: *void) -> s32 #c_call {
+    return native_read(state);
+}
+callback_theme_read :: (state: *void) -> s32 #c_call {
+    return native_theme_read(state);
+}
+callback_theme_compile :: (state: *void) -> s32 #c_call {
+    return native_theme_compile(state);
+}
+callback_write :: (state: *void) -> s32 #c_call {
+    return native_write(state);
+}
+callback_execute :: (state: *void) -> s32 #c_call {
+    return native_execute(state);
+}
+callback_exit :: (state: *void) -> s32 #c_call {
+    return native_exit(state);
+}
+callback_executables :: (state: *void) -> s32 #c_call {
+    return native_executables(state);
+}
+callback_which :: (state: *void) -> s32 #c_call {
+    return native_which(state);
+}
+callback_clear :: (state: *void) -> s32 #c_call {
+    return native_clear(state);
+}
+callback_fls :: (state: *void) -> s32 #c_call {
+    return native_fls(state);
+}
+callback_fls_records :: (state: *void) -> s32 #c_call {
+    return native_fls_records(state);
+}
 bind_native :: (state: *void, name: str, callback: Callback) {
     push_callback(state, callback, 0);
     set_field(state, -2, name.data);
 }
 
 #public {
+
 requested_exit: bool;
 requested_code: s32;
 install :: (state: *void) {
@@ -377,4 +471,5 @@ install :: (state: *void) {
     else text_field(state, "platform", "unix");
     set_global(state, "_lush".data);
 }
+
 }

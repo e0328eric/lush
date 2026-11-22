@@ -31,8 +31,11 @@ console_exit_cleanup :: () #c_call {
 embedded_source :: (name: str) -> str {
     path := path_join(path_dirname(#source_location.filename), name);
     if read_file(path) == {
-    case .Ok(source); return source;
-    case .Err(error); print("could not embed Lua shell: {}\n", error.kind); return "";
+    case .Ok(source);
+        return source;
+    case .Err(error);
+        print("could not embed Lua shell: {}\n", error.kind);
+        return "";
     }
 }
 BOOTSTRAP :: #comptime embedded_source("bootstrap.lua");
@@ -57,6 +60,7 @@ load_library :: (state: *void, source: str, name: str) -> bool {
 }
 
 #public {
+
 Console_Modes :: struct {
     input_code_page: u32;
     output_code_page: u32;
@@ -83,7 +87,7 @@ restore_console :: (modes: Console_Modes) {
     #if OUT.os == .Windows {
         // Flush while the UTF-8 page is still active, including output without LF.
         _ := flush_streams(null);
-        if modes.input_changed _ := set_input_code_page(modes.input_code_page);
+        if modes.input_changed  _ := set_input_code_page(modes.input_code_page);
         if modes.output_changed _ := set_output_code_page(modes.output_code_page);
         saved_console_modes.input_changed = false;
         saved_console_modes.output_changed = false;
@@ -94,11 +98,20 @@ Evaluation :: struct {
     message: str;
     incomplete: bool;
 }
-Prompt_Line :: struct { left: str; right: str; }
-Prompt :: struct { input: str; lines: [..]Prompt_Line; }
+Prompt_Line :: struct {
+    left: str;
+    right: str;
+}
+Prompt :: struct {
+    input: str;
+    lines: [..]Prompt_Line;
+}
 release_prompt :: (prompt: *Prompt) {
     prompt.input.free();
-    for line: prompt.lines { line.left.free(); line.right.free(); }
+    for line: prompt.lines {
+        line.left.free();
+        line.right.free();
+    }
     prompt.lines.free();
     prompt.* = .{};
 }
@@ -113,8 +126,10 @@ configure_file :: (state: *void, path: str) {
     if Lua.get_global(state, "lush".data) != 5 return;
     full: str;
     if absolute(path) == {
-    case .Ok(value); full = value;
-    case .Err; full = path.clone();
+    case .Ok(value);
+        full = value;
+    case .Err;
+        full = path.clone();
     }
     defer full.free();
     Lua.push_text(state, full);
@@ -211,17 +226,20 @@ prompt :: (state: *void) -> Prompt {
             count := cast(ssize) Lua.raw_length(state, lines);
             if count > 4 count = 4;
             for i: 1..=count {
-                if Lua.raw_get_integer(state, lines, i) != 5 { valid = false; break; }
+                if Lua.raw_get_integer(state, lines, i) != 5 {
+                    valid = false;
+                    break;
+                }
                 line := Lua.get_top(state);
                 value: Prompt_Line;
                 Lua.push_text(state, "left");
                 kind = Lua.raw_get(state, line);
-                if kind == 4 value.left = Lua.text(state, -1).clone();
+                if      kind == 4 value.left = Lua.text(state, -1).clone();
                 else if kind != 0 valid = false;
                 Lua.pop(state);
                 Lua.push_text(state, "right");
                 kind = Lua.raw_get(state, line);
-                if kind == 4 value.right = Lua.text(state, -1).clone();
+                if      kind == 4 value.right = Lua.text(state, -1).clone();
                 else if kind != 0 valid = false;
                 Lua.pop(state);
                 result.lines.push(value);
@@ -242,7 +260,7 @@ last_status :: (state: *void) -> s32 {
     Lua.get_field(state, -1, "last_status".data);
     valid: s32;
     code := Lua.to_integer(state, -1, &valid);
-    if valid == 0 return 0;
+    if valid == 0             return 0;
     if code < 0 || code > 255 return 1;
     return cast(s32) code;
 }
@@ -256,4 +274,5 @@ set_arguments :: (state: *void, script: str, arguments: []const str) {
     }
     Lua.set_global(state, "arg".data);
 }
+
 }

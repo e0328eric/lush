@@ -19,7 +19,8 @@ restore_cursor :: (session: *Terminal_Session) -> Io_Error!ssize {
 }
 
 render :: (
-    canvas: *Terminal_Canvas, session: *Terminal_Session,
+    canvas: *Terminal_Canvas,
+    session: *Terminal_Session,
     caret: Terminal_Point = .{ -1, -1 }
 ) -> Io_Error!ssize {
     _ := hide_cursor(session)?;

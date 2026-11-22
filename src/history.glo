@@ -77,7 +77,8 @@ load :: (path: str, limit: ssize = 1000) -> Load {
     }
     file: File;
     if File.open(path) == {
-    case .Ok(opened); file = opened;
+    case .Ok(opened);
+        file = opened;
     case .Err(error);
         if error.kind != .Not_Found result.error = file_error(path, "read", error);
         return result;
@@ -88,8 +89,11 @@ load :: (path: str, limit: ssize = 1000) -> Load {
     defer _ := file.unlock();
     length: s64;
     if file.seek(0, .End) == {
-    case .Ok(value); length = value;
-    case .Err(error); result.error = file_error(path, "seek", error); return result;
+    case .Ok(value);
+        length = value;
+    case .Err(error);
+        result.error = file_error(path, "seek", error);
+        return result;
     }
     start: s64;
     if length > MAX_HISTORY_BYTES start = length - MAX_HISTORY_BYTES;
@@ -97,8 +101,11 @@ load :: (path: str, limit: ssize = 1000) -> Load {
     if start > 0 {
         preceding: [1]u8;
         if file.read_at(preceding[..], start - 1) == {
-        case .Ok(read); skip_fragment = read != 1 || preceding[0] != 10;
-        case .Err(error); result.error = file_error(path, "read", error); return result;
+        case .Ok(read);
+            skip_fragment = read != 1 || preceding[0] != 10;
+        case .Err(error);
+            result.error = file_error(path, "read", error);
+            return result;
         }
     }
     if #pattern .Err(error) = file.seek(start) {
@@ -107,7 +114,10 @@ load :: (path: str, limit: ssize = 1000) -> Load {
     }
 
     ring: [..]str;
-    defer { for command: ring command.free(); ring.free(); }
+    defer {
+        for command: ring command.free();
+        ring.free();
+    }
     empty: str;
     for i: 0..limit ring.push(empty);
     head: ssize;
@@ -121,7 +131,8 @@ load :: (path: str, limit: ssize = 1000) -> Load {
         #temp_scope {
             bytes: ssize;
             if file.read_into(buffer[..]) == {
-            case .Ok(read); bytes = read;
+            case .Ok(read);
+                bytes = read;
             case .Err(error);
                 if error.kind != .End_Of_File result.error = file_error(path, "read", error);
                 break;
@@ -134,7 +145,9 @@ load :: (path: str, limit: ssize = 1000) -> Load {
                         case .Ok(command);
                             if command.trim().count == 0 command.free();
                             else {
-                                while count > 0 && (count == limit || stored_bytes + command.count > MAX_HISTORY_BYTES) {
+                                while count > 0 && (
+                                    count == limit || stored_bytes + command.count > MAX_HISTORY_BYTES
+                                ) {
                                     stored_bytes -= ring[head].count;
                                     ring[head].free();
                                     ring[head] = empty;
@@ -169,15 +182,19 @@ load :: (path: str, limit: ssize = 1000) -> Load {
 append :: (path: str, command: str) -> str {
     empty: str;
     if path.count == 0 || command.trim().count == 0 return empty;
-    if path.has_nul() return "history path contains NUL".clone();
-    if command.count > MAX_RECORD_BYTES return "command is too large for persistent history".clone();
+    if path.has_nul()                               return "history path contains NUL".clone();
+    if command.count > MAX_RECORD_BYTES
+        return "command is too large for persistent history".clone();
     encoded: str;
     if json_serialize(command) == {
-    case .Ok(value); encoded = value;
-    case .Err; return "command cannot be encoded as JSON history".clone();
+    case .Ok(value);
+        encoded = value;
+    case .Err;
+        return "command cannot be encoded as JSON history".clone();
     }
     defer encoded.free();
-    if encoded.count > MAX_RECORD_BYTES return "encoded command is too large for persistent history".clone();
+    if encoded.count > MAX_RECORD_BYTES
+        return "encoded command is too large for persistent history".clone();
     if metadata(path, true) == {
     case .Ok(info);
         if info.kind != .Regular return tprint("history {} is not a regular file", path).clone();
@@ -186,16 +203,25 @@ append :: (path: str, command: str) -> str {
     }
     parent := path_dirname(path);
     if parent.count > 0 {
-        if #pattern .Err(error) = create_directory(parent,
+        if #pattern .Err(error) = create_directory(
+            parent,
             .permissions = .Owner_Read | .Owner_Write | .Owner_Execute,
-            .make_parent = true)
+            .make_parent = true
+        )
             return file_error(path, "create directory for", error);
     }
     file: File;
-    if File.open(path, .access = .Read_Write, .disposition = .Open_Or_Create,
-        .permissions = .Owner_Read | .Owner_Write, .flags = .Append) == {
-    case .Ok(opened); file = opened;
-    case .Err(error); return file_error(path, "append", error);
+    if File.open(
+        path,
+        .access = .Read_Write,
+        .disposition = .Open_Or_Create,
+        .permissions = .Owner_Read | .Owner_Write,
+        .flags = .Append
+    ) == {
+    case .Ok(opened);
+        file = opened;
+    case .Err(error);
+        return file_error(path, "append", error);
     }
     defer file.free();
     locked := lock_file(&file, .Exclusive);
@@ -203,8 +229,10 @@ append :: (path: str, command: str) -> str {
     defer _ := file.unlock();
     length: s64;
     if file.seek(0, .End) == {
-    case .Ok(value); length = value;
-    case .Err(error); return file_error(path, "seek", error);
+    case .Ok(value);
+        length = value;
+    case .Err(error);
+        return file_error(path, "seek", error);
     }
     record: String_Builder;
     defer record.free();
@@ -212,9 +240,10 @@ append :: (path: str, command: str) -> str {
         last: [1]u8;
         if file.read_at(last[..], length - 1) == {
         case .Ok(read);
-            if read != 1 return "could not inspect the end of history".clone();
+            if read != 1     return "could not inspect the end of history".clone();
             if last[0] != 10 record.write_byte(10);
-        case .Err(error); return file_error(path, "read end of", error);
+        case .Err(error);
+            return file_error(path, "read end of", error);
         }
     }
     record.write_string(encoded);
@@ -225,7 +254,8 @@ append :: (path: str, command: str) -> str {
         case .Ok(written);
             if written <= 0 return "history write made no progress".clone();
             remaining = remaining[written..];
-        case .Err(error); return file_error(path, "append", error);
+        case .Err(error);
+            return file_error(path, "append", error);
         }
     }
     return empty;

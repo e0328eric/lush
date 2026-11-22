@@ -13,7 +13,8 @@
 template_source :: () -> str {
     path := path_join(path_dirname(#source_location.filename), "default_init.lua");
     if read_file(path) == {
-    case .Ok(source); return source;
+    case .Ok(source);
+        return source;
     case .Err(error);
         print("could not embed default configuration: {}\n", error.kind.reason());
         exit(1);
@@ -49,15 +50,23 @@ create_if_missing :: (path: str, contents: str) -> str {
     }
     parent := path_dirname(path);
     if parent.count == 0 parent = ".";
-    if #pattern .Err(error) = create_directory(parent,
-        .permissions = .Owner_Read | .Owner_Write | .Owner_Execute, .make_parent = true)
-        return tprint("could not create configuration directory {}: {}", parent, error.kind.reason()).clone();
+    if #pattern .Err(error) = create_directory(
+        parent,
+        .permissions = .Owner_Read | .Owner_Write | .Owner_Execute,
+        .make_parent = true
+    )
+        return tprint(
+            "could not create configuration directory {}: {}",
+            parent,
+            error.kind.reason()
+        ).clone();
     // Publish the complete template without replacement, including when two
     // shells start together. Rename checks the final entry without following
     // a symbolic link another process may have created in the meantime.
     staged: Temporary_File;
     if Temporary_File.create_temporary_file(parent, .prefix = ".init-", .suffix = ".tmp") == {
-    case .Ok(file); staged = file;
+    case .Ok(file);
+        staged = file;
     case .Err(error);
         return tprint("could not stage configuration {}: {}", path, error.kind.reason()).clone();
     }
@@ -66,7 +75,8 @@ create_if_missing :: (path: str, contents: str) -> str {
     while remaining.count > 0 {
         if staged.file.write(remaining) == {
         case .Ok(written);
-            if written <= 0 return tprint("could not write configuration {}: no progress", path).clone();
+            if written <= 0
+                return tprint("could not write configuration {}: no progress", path).clone();
             remaining = remaining[written..];
         case .Err(error);
             return tprint("could not write configuration {}: {}", path, error.kind.reason()).clone();
@@ -83,7 +93,9 @@ create_if_missing :: (path: str, contents: str) -> str {
     return empty;
 }
 
-ensure_default :: (path: str) -> str { return create_if_missing(path, DEFAULT_INIT); }
+ensure_default :: (path: str) -> str {
+    return create_if_missing(path, DEFAULT_INIT);
+}
 
 // Theme definitions stay external Lua configuration, never compiled into Lush.
 // Seed missing user files from the distribution directory without replacing edits.
@@ -102,7 +114,11 @@ install_theme_files :: (config_path: str, source_directory: str = "") -> str {
     if read_directory(bundle) == {
     case .Err(error);
         if error.kind == .Not_Found return empty;
-        return tprint("could not read theme configuration directory {}: {}", bundle, error.kind.reason()).clone();
+        return tprint(
+            "could not read theme configuration directory {}: {}",
+            bundle,
+            error.kind.reason()
+        ).clone();
     case .Ok(entries);
         defer entries.free();
         for entry: entries.entries {
@@ -115,7 +131,11 @@ install_theme_files :: (config_path: str, source_directory: str = "") -> str {
             if #pattern .Ok(info) = metadata(target, .follow_symlink = false) continue;
             if read_file(source) == {
             case .Err(error);
-                return tprint("could not read theme configuration {}: {}", source, error.kind.reason()).clone();
+                return tprint(
+                    "could not read theme configuration {}: {}",
+                    source,
+                    error.kind.reason()
+                ).clone();
             case .Ok(contents);
                 defer contents.free();
                 error := create_if_missing(target, contents);

@@ -54,8 +54,14 @@ run :: (args: []const str) -> s32 {
         _ := stderr.writef("fls: {}\nTry 'fls --help' for more information.\n", message);
         return 3;
     }
-    if options.help { print("{}", Options.usage_text()); return 0; }
-    if options.version { print("fls {}\n", Options.FLS_VERSION); return 0; }
+    if options.help {
+        print("{}", Options.usage_text());
+        return 0;
+    }
+    if options.version {
+        print("fls {}\n", Options.FLS_VERSION);
+        return 0;
+    }
     if options.lol != .Off return Lol.run_lol(options.lol, options.snapshot, options.width);
     if options.tui || options.snapshot {
         if options.icons == .Never && !has_flag(args, "--icons") && !has_flag(args, "--no-icons")
@@ -123,7 +129,8 @@ records :: (args: []const str) -> Record_List {
     }
     if options.paths.count == 0 options.paths.push(".");
     scan: Size_Scan;
-    if options.total_size scan = Size_Scan.start(terminal_capabilities().unwrap_or(.{}).interactive);
+    if options.total_size
+        scan = Size_Scan.start(terminal_capabilities().unwrap_or(.{}).interactive);
     defer scan.clear();
     files: [..]Entries.Entry;
     defer files.free();
@@ -133,8 +140,12 @@ records :: (args: []const str) -> Record_List {
         entry := Entries.entry_make(path, path, options.filter.dereference);
         if !entry.stat_ok {
             result.code = 2;
-            result.error = tprint("{}: {} (os error {})", path,
-                Util.os_error_text(entry.stat_code), entry.stat_code).clone();
+            result.error = tprint(
+                "{}: {} (os error {})",
+                path,
+                Util.os_error_text(entry.stat_code),
+                entry.stat_code
+            ).clone();
             entry.free();
             return result;
         }
@@ -145,7 +156,7 @@ records :: (args: []const str) -> Record_List {
             }
         }
         if entry.is_dir && !options.list_dirs directories.push(entry);
-        else files.push(entry);
+        else                                  files.push(entry);
     }
     Entries.sort_entries(files.view(), options.sort);
     if options.tree {
@@ -173,19 +184,32 @@ records :: (args: []const str) -> Record_List {
 
 kind_name :: (entry: *Entries.Entry) -> str {
     if entry.meta.kind == {
-    case .Directory; return "dir";
-    case .Regular; return "file";
-    case .Symlink; return "symlink";
-    case .Fifo; return "fifo";
-    case .Socket; return "socket";
-    case .Block_Device; return "block";
-    case .Character_Device; return "character";
-    else; return "other";
+    case .Directory;
+        return "dir";
+    case .Regular;
+        return "file";
+    case .Symlink;
+        return "symlink";
+    case .Fifo;
+        return "fifo";
+    case .Socket;
+        return "socket";
+    case .Block_Device;
+        return "block";
+    case .Character_Device;
+        return "character";
+    else;
+        return "other";
     }
 }
 
-append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options.Options, depth: s64,
-    scan: *Size_Scan) {
+append_record :: (
+    result: *Record_List,
+    entry: *Entries.Entry,
+    options: *Options.Options,
+    depth: s64,
+    scan: *Size_Scan
+) {
     record: Record;
     record.name = entry.name.clone();
     record.path = entry.path.clone();
@@ -209,8 +233,13 @@ append_record :: (result: *Record_List, entry: *Entries.Entry, options: *Options
     result.items.push(record);
 }
 
-collect_directory :: (result: *Record_List, path: str, options: *Options.Options, depth: s64,
-    scan: *Size_Scan) -> bool {
+collect_directory :: (
+    result: *Record_List,
+    path: str,
+    options: *Options.Options,
+    depth: s64,
+    scan: *Size_Scan
+) -> bool {
     if options.tree && options.level >= 0 && depth > options.level return true;
     if depth > 1024 {
         result.code = 2;

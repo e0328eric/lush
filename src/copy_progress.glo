@@ -16,17 +16,30 @@
 }
 
 #public {
+
 Progress :: #fn_ptr(state: *void, completed: s64, total: s64, entries: s64);
 
 error_message :: (error: Fs_Error) -> str {
     if error.kind == .Already_Exists && error.operation == .Change_Mode {
         detail := ifx error.os_code == 0 "" else tprint(" (Windows error {})", error.os_code);
-        return tprint("copy needs a case-sensitive destination for '{}' and '{}'{}", error.path, error.other_path, detail);
+        return tprint(
+            "copy needs a case-sensitive destination for '{}' and '{}'{}",
+            error.path,
+            error.other_path,
+            detail
+        );
     }
-    if error.other_path.count > 0 return tprint("{} -> {}: {} (os {})",
-        error.path, error.other_path, error.kind.reason(), error.os_code);
+    if error.other_path.count > 0
+        return tprint(
+            "{} -> {}: {} (os {})",
+            error.path,
+            error.other_path,
+            error.kind.reason(),
+            error.os_code
+        );
     return tprint("{}: {} (os {})", error.path, error.kind.reason(), error.os_code);
 }
+
 }
 
 // Only a file larger than the native write buffer needs partial-byte samples.
@@ -58,14 +71,24 @@ Copy_Job :: struct {
     result: Fs_Error!s64;
 }
 
-native_copy :: (source: str, destination: str, directory: bool, policy: Copy_Policy,
-    observer: Copy_Observer = .{}) -> Fs_Error!s64 {
-    if directory return .Ok(cast(s64) copy_tree(source, destination, policy, .observer = observer)?);
+native_copy :: (
+    source: str,
+    destination: str,
+    directory: bool,
+    policy: Copy_Policy,
+    observer: Copy_Observer = .{}
+) -> Fs_Error!s64 {
+    if directory
+        return .Ok(cast(s64) copy_tree(source, destination, policy, .observer = observer)?);
     return copy_file(source, destination, policy);
 }
 
 watch_file :: (job: *Copy_Job, source: str, destination: str, size: s64) {
-    file := Large_File.{ .source = source.clone(), .destination = destination.clone(), .size = size };
+    file := Large_File.{
+        .source = source.clone(),
+        .destination = destination.clone(),
+        .size = size
+    };
     if job.policy == .Overwrite {
         if #pattern .Ok(previous) = metadata(destination, false) {
             if previous.kind == .Regular file.original_size = previous.size;
@@ -80,12 +103,23 @@ count_bytes :: (job: *Copy_Job, path: str, entry: Directory_Entry, depth: ssize)
     job.notify(job.state, job.scanned, -1, -1);
     if entry.kind != .Regular return .Continue;
     #temp_scope {
-        #pattern .Ok(info) := metadata(path, false) else { job.total = -1; return .Stop; };
-        if info.size < 0 || info.size > MAX_BYTES - job.total { job.total = -1; return .Stop; }
+        #pattern .Ok(info) := metadata(path, false) else {
+            job.total = -1;
+            return .Stop;
+        };
+        if info.size < 0 || info.size > MAX_BYTES - job.total {
+            job.total = -1;
+            return .Stop;
+        }
         job.total += info.size;
         if info.size > COPY_BUFFER_SIZE {
-            #pattern .Ok(relative) := path_lexically_relative(path, job.source, .allocator = context.temp_allocator)
-                else { return .Continue; };
+            #pattern .Ok(relative) := path_lexically_relative(
+                path,
+                job.source,
+                .allocator = context.temp_allocator
+            ) else {
+                return .Continue;
+            };
             // Windows trees use the parallel copier. Keep symlink/.. in a
             // POSIX destination prefix intact when sampling a large child.
             target := tprint("{}/{}", job.destination, relative);
@@ -98,7 +132,9 @@ count_bytes :: (job: *Copy_Job, path: str, entry: Directory_Entry, depth: ssize)
 // The stdlib notifies on the copying thread after completing each object.
 // Count only the data in regular files, including overwritten files.
 entry_copied :: (pointer: ?*void, source: str, destination: str, completed: ssize) {
-    #pattern ?value := pointer else { return; };
+    #pattern ?value := pointer else {
+        return;
+    };
     job := cast(*Copy_Job) value;
     job.entries.store(completed);
     if #pattern ?index = job.by_source.get(source) job.files[index.*].completed.store(true);
@@ -114,15 +150,22 @@ entry_copied :: (pointer: ?*void, source: str, destination: str, completed: ssiz
 
 // A filesystem diagnostic can borrow a temporary path on its worker thread.
 keep_error :: (error: Fs_Error) -> Fs_Error {
-    return error.with_path(error.path.clone(heap_allocator()), error.other_path.clone(heap_allocator()));
+    return error.with_path(
+        error.path.clone(heap_allocator()),
+        error.other_path.clone(heap_allocator())
+    );
 }
 
 take_result :: (result: Fs_Error!s64) -> Fs_Error!s64 {
     if #pattern .Err(error) = result {
         defer error.path.free(heap_allocator());
         defer error.other_path.free(heap_allocator());
-        return .Err(error.with_path(error.path.clone(context.temp_allocator).into_temporary(),
-            error.other_path.clone(context.temp_allocator).into_temporary()));
+        return .Err(
+            error.with_path(
+                error.path.clone(context.temp_allocator).into_temporary(),
+                error.other_path.clone(context.temp_allocator).into_temporary()
+            )
+        );
     }
     return result;
 }
@@ -130,7 +173,11 @@ take_result :: (result: Fs_Error!s64) -> Fs_Error!s64 {
 copy_on_worker :: (pointer: *void) -> ?*void #c_call {
     job := cast(*Copy_Job) pointer;
     #temp_scope {
-        observer := Copy_Observer.{ .state = ?pointer, .progress = ?entry_copied, .child_errors = true };
+        observer := Copy_Observer.{
+            .state = ?pointer,
+            .progress = ?entry_copied,
+            .child_errors = true
+        };
         job.result = native_copy(job.source, job.destination, job.directory, job.policy, observer);
         if #pattern .Err(error) = job.result job.result = .Err(keep_error(error));
     }
@@ -150,7 +197,11 @@ partial_size :: (file: *Large_File) -> s64 {
     return 0;
 }
 
-Sample :: struct { remaining: ssize; active: ssize = -1; cursor: ssize; }
+Sample :: struct {
+    remaining: ssize;
+    active: ssize = -1;
+    cursor: ssize;
+}
 
 sample_partial :: (job: *Copy_Job, sample: *Sample) -> s64 {
     // The native copy takes directory children off a stack. Its next large
@@ -168,24 +219,37 @@ sample_partial :: (job: *Copy_Job, sample: *Sample) -> s64 {
     // other candidates and remember a partial file once we find it.
     probes := ifx sample.remaining > 4 4 else sample.remaining - 1;
     for i: 0..probes {
-        if sample.cursor <= 0 || sample.cursor >= sample.remaining sample.cursor = sample.remaining - 1;
+        if sample.cursor <= 0 || sample.cursor >= sample.remaining
+            sample.cursor = sample.remaining - 1;
         sample.cursor -= 1;
         bytes = partial_size(&job.files[sample.cursor]);
-        if bytes > 0 { sample.active = sample.cursor; return bytes; }
+        if bytes > 0 {
+            sample.active = sample.cursor;
+            return bytes;
+        }
     }
     return 0;
 }
 
 #public {
+
 // A negative total distinguishes scanning (-1), transferred bytes while
 // sizing (-2), and completed entries in a tree with no measurable bytes (-3).
-copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
-    notify: ?Progress, state: *void) -> Fs_Error!s64 {
+copy :: (
+    source: str,
+    destination: str,
+    info: Metadata,
+    policy: Copy_Policy,
+    notify: ?Progress,
+    state: *void
+) -> Fs_Error!s64 {
     directory := info.kind == .Directory;
     #if OUT.os == .Windows {
         if directory return copy_windows_tree(source, destination, info, policy, notify, state);
     }
-    #pattern ?update := notify else { return native_copy(source, destination, directory, policy); };
+    #pattern ?update := notify else {
+        return native_copy(source, destination, directory, policy);
+    };
     if !directory && (info.kind != .Regular || info.size <= COPY_BUFFER_SIZE) {
         update(state, 0, info.size, -1);
         return copy_file(source, destination, policy);
@@ -193,11 +257,20 @@ copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
     if policy == .Fail_If_Exists && metadata(destination, false).is_ok()
         return native_copy(source, destination, directory, policy);
 
-    job := Copy_Job.{ .source = source, .destination = destination, .policy = policy,
-        .directory = directory, .notify = update, .state = state };
+    job := Copy_Job.{
+        .source = source,
+        .destination = destination,
+        .policy = policy,
+        .directory = directory,
+        .notify = update,
+        .state = state
+    };
     defer {
         job.by_source.free();
-        for *file: job.files { file.source.free(); file.destination.free(); }
+        for *file: job.files {
+            file.source.free();
+            file.destination.free();
+        }
         job.files.free();
     }
     if directory {
@@ -208,8 +281,9 @@ copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
         watch_file(&job, source, destination, info.size);
     }
     update(state, 0, job.total, -1);
-    #pattern .Ok(thread) := Thread.spawn(copy_on_worker, &job)
-        else { return native_copy(source, destination, directory, policy); };
+    #pattern .Ok(thread) := Thread.spawn(copy_on_worker, &job) else {
+        return native_copy(source, destination, directory, policy);
+    };
     sample := Sample.{ .remaining = job.files.count };
     shown: s64;
     delay: s64 = 1;
@@ -221,11 +295,11 @@ copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
             // confirmed size only once, and keep displayed bytes monotonic.
             current := job.confirmed.load();
             if current == confirmed && partial <= MAX_BYTES - current current += partial;
-            if current > shown shown = current;
+            if current > shown                                        shown = current;
             entries := ifx directory job.entries.load() else -1;
-            if job.total == 0 update(state, entries, -3, entries);
-            else if job.total < 0 update(state, shown, -2, entries);
-            else update(state, shown, job.total, entries);
+            if      job.total == 0 update(state, entries, -3, entries);
+            else if job.total < 0  update(state, shown, -2, entries);
+            else                   update(state, shown, job.total, entries);
         }
         sleep_ms(delay);
         if delay < 32 delay *= 2;
@@ -233,6 +307,7 @@ copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
     _ := thread.join();
     return take_result(job.result);
 }
+
 }
 
 #if OUT.os == .Windows {
@@ -265,26 +340,66 @@ copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
     run_windows_tree :: (pointer: *void) -> ?*void #c_call {
         job := cast(*Windows_Job) pointer;
         #temp_scope {
-            observer := Copy_Observer.{ .state = ?pointer, .progress = ?windows_entry, .child_errors = true };
-            if Windows_Tree.copy(job.source, job.destination, job.info, job.policy, observer, ?&job.bytes) == {
-            case .Ok(count); job.result = .Ok(cast(s64) count);
-            case .Err(error); job.result = .Err(keep_error(error));
+            observer := Copy_Observer.{
+                .state = ?pointer,
+                .progress = ?windows_entry,
+                .child_errors = true
+            };
+            if Windows_Tree.copy(
+                job.source,
+                job.destination,
+                job.info,
+                job.policy,
+                observer,
+                ?&job.bytes
+            ) == {
+            case .Ok(count);
+                job.result = .Ok(cast(s64) count);
+            case .Err(error);
+                job.result = .Err(keep_error(error));
             }
         }
         job.finished.store(true);
         return null;
     }
 
-    copy_windows_tree :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
-        notify: ?Progress, state: *void) -> Fs_Error!s64 {
+    copy_windows_tree :: (
+        source: str,
+        destination: str,
+        info: Metadata,
+        policy: Copy_Policy,
+        notify: ?Progress,
+        state: *void
+    ) -> Fs_Error!s64 {
         #pattern ?update := notify else {
-            return .Ok(cast(s64) Windows_Tree.copy(source, destination, info, policy, .{ .child_errors = true })?);
+            return .Ok(
+                cast(s64) Windows_Tree.copy(
+                    source,
+                    destination,
+                    info,
+                    policy,
+                    .{ .child_errors = true }
+                )?
+            );
         };
-        job := Windows_Job.{ .source = source, .destination = destination, .info = info, .policy = policy };
+        job := Windows_Job.{
+            .source = source,
+            .destination = destination,
+            .info = info,
+            .policy = policy
+        };
         job.total.store(-1);
         baseline := Metrics.io_sample();
         #pattern .Ok(worker) := Thread.spawn(run_windows_tree, &job) else {
-            return .Ok(cast(s64) Windows_Tree.copy(source, destination, info, policy, .{ .child_errors = true })?);
+            return .Ok(
+                cast(s64) Windows_Tree.copy(
+                    source,
+                    destination,
+                    info,
+                    policy,
+                    .{ .child_errors = true }
+                )?
+            );
         };
         // Counting available bytes is optional. Start the transfer first and
         // stop the inventory immediately on a copy failure or early completion.

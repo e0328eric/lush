@@ -7,6 +7,7 @@
 #import "Strings/Utf8";
 
 #public {
+
 VARIABLE :: ifx OUT.os == .Windows "USERPROFILE" else "HOME";
 
 has_prefix :: (path: str) -> bool {
@@ -25,7 +26,7 @@ unavailable :: () -> str {
 from_home :: (suffix: str, allocator := context.allocator) -> ?str {
     home := directory();
     defer home.free();
-    if home.count == 0 return null;
+    if home.count == 0                                             return null;
     if suffix.count > 0 && path_is_separator(home[home.count - 1]) suffix = suffix[1..];
     result := String_Builder.make_len_cap(0, home.count + suffix.count, allocator);
     result.write_string(home);
@@ -41,4 +42,5 @@ resolve :: (path: str, allocator: Allocator) -> ?str {
     if !has_prefix(path) return ?path;
     return from_home(path[1..], allocator);
 }
+
 }

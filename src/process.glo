@@ -70,7 +70,8 @@ execute :: (
     defer error_file.free();
     if has_input {
         if Temporary_File.create_temporary_file("", "lush-stdin-") == {
-        case .Ok(value); input_file = value;
+        case .Ok(value);
+            input_file = value;
         case .Err(error);
             out.code = 1;
             out.error = tprint("cannot create pipeline input: {}", error.kind).clone();
@@ -100,14 +101,16 @@ execute :: (
     }
     if capture {
         if Temporary_File.create_temporary_file("", "lush-stdout-") == {
-        case .Ok(value); output_file = value;
+        case .Ok(value);
+            output_file = value;
         case .Err(error);
             out.code = 1;
             out.error = tprint("cannot capture stdout: {}", error.kind).clone();
             return out;
         }
         if Temporary_File.create_temporary_file("", "lush-stderr-") == {
-        case .Ok(value); error_file = value;
+        case .Ok(value);
+            error_file = value;
         case .Err(error);
             out.code = 1;
             out.error = tprint("cannot capture stderr: {}", error.kind).clone();
@@ -120,7 +123,8 @@ execute :: (
     defer cleanup(&children, &pipes);
     for i: 1..commands.count {
         if process_pipe_create() == {
-        case .Ok(pipe); pipes.push(pipe);
+        case .Ok(pipe);
+            pipes.push(pipe);
         case .Err(error);
             out.code = 1;
             out.error = tprint("cannot create pipeline: {}", error.kind).clone();
@@ -131,13 +135,14 @@ execute :: (
         args := commands[i].args;
         command := Command.command_make(args[0], args[1..]);
         defer command.destroy();
-        if i > 0 command.redirect_stdin(&pipes[i - 1].read_end);
+        if      i > 0     command.redirect_stdin(&pipes[i - 1].read_end);
         else if has_input command.redirect_stdin(&input_file.file);
-        if i + 1 < commands.count command.redirect_stdout(&pipes[i].write_end);
-        else if capture command.redirect_stdout(&output_file.file);
+        if      i + 1 < commands.count command.redirect_stdout(&pipes[i].write_end);
+        else if capture                command.redirect_stdout(&output_file.file);
         if capture command.redirect_stderr(&error_file.file);
         if command.spawn() == {
-        case .Ok(child); children.push(child);
+        case .Ok(child);
+            children.push(child);
         case .Err(error);
             out.code = 126;
             if error.kind == .Not_Found out.code = 127;
@@ -172,7 +177,8 @@ execute :: (
             return out;
         }
         if output_file.file.read() == {
-        case .Ok(value); out.stdout = value;
+        case .Ok(value);
+            out.stdout = value;
         case .Err(error);
             out.code = 1;
             out.error = tprint("cannot read captured stdout: {}", error.kind).clone();
@@ -184,7 +190,8 @@ execute :: (
             return out;
         }
         if error_file.file.read() == {
-        case .Ok(value); out.stderr = value;
+        case .Ok(value);
+            out.stderr = value;
         case .Err(error);
             out.code = 1;
             out.error = tprint("cannot read captured stderr: {}", error.kind).clone();
@@ -200,7 +207,7 @@ execute :: (
 
 close_pipes :: (pipes: *[..]Process_Pipe) {
     for i: 0..pipes.*.count {
-        if pipes.*[i].read_end.valid _ := pipes.*[i].read_end.close();
+        if pipes.*[i].read_end.valid  _ := pipes.*[i].read_end.close();
         if pipes.*[i].write_end.valid _ := pipes.*[i].write_end.close();
     }
 }

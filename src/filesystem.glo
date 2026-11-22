@@ -21,11 +21,22 @@ failure :: (state: *void, message: str) -> s32 {
 }
 fs_failure :: (state: *void, error: Fs_Error) -> s32 {
     if error.other_path.count > 0
-        return failure(state, tprint("{} -> {}: {} (os {})",
-            error.path, error.other_path, error.kind.reason(), error.os_code));
+        return failure(
+            state,
+            tprint(
+                "{} -> {}: {} (os {})",
+                error.path,
+                error.other_path,
+                error.kind.reason(),
+                error.os_code
+            )
+        );
     return failure(state, tprint("{}: {} (os {})", error.path, error.kind.reason(), error.os_code));
 }
-success :: (state: *void) -> s32 { Lua.push_boolean(state, 1); return 1; }
+success :: (state: *void) -> s32 {
+    Lua.push_boolean(state, 1);
+    return 1;
+}
 valid_path :: (state: *void, index: s32) -> bool {
     return Lua.value_type(state, index) == 4 && Lua.text(state, index).count > 0 &&
         !Lua.text(state, index).has_nul();
@@ -48,10 +59,14 @@ integer_field :: (state: *void, name: str, value: s64) {
 }
 kind_name :: (kind: File_Kind) -> str {
     if kind == {
-    case .Regular; return "file";
-    case .Directory; return "dir";
-    case .Symlink; return "symlink";
-    else; return "other";
+    case .Regular;
+        return "file";
+    case .Directory;
+        return "dir";
+    case .Symlink;
+        return "symlink";
+    else;
+        return "other";
     }
 }
 
@@ -59,8 +74,10 @@ native_mkdir :: (state: *void) -> s32 {
     if !valid_path(state, 1) || !valid_bool(state, 2)
         return failure(state, "mkdir: expected a nonempty path and optional parents boolean");
     if create_directory(Lua.text(state, 1), .make_parent = boolean(state, 2, true)) == {
-    case .Err(error); return fs_failure(state, error);
-    case .Ok; return success(state);
+    case .Err(error);
+        return fs_failure(state, error);
+    case .Ok;
+        return success(state);
     }
 }
 native_touch :: (state: *void) -> s32 {
@@ -71,17 +88,22 @@ native_touch :: (state: *void) -> s32 {
     case .Err(error);
         if error.kind != .Not_Found return fs_failure(state, error);
         if File.open(path, .access = .Write, .disposition = .Open_Or_Create) == {
-        case .Err(open_error); return fs_failure(state, open_error);
+        case .Err(open_error);
+            return fs_failure(state, open_error);
         case .Ok(file);
             defer file.free();
             if #pattern .Err(close_error) = file.close() return fs_failure(state, close_error);
         }
     }
     if unix_now() == {
-    case .Err(error); return failure(state, tprint("touch: cannot read clock: {}", error));
+    case .Err(error);
+        return failure(state, tprint("touch: cannot read clock: {}", error));
     case .Ok(now);
-        timestamp := File_Timestamp.{ .seconds = now.seconds,
-            .nanoseconds = now.nanosecond, .valid = true };
+        timestamp := File_Timestamp.{
+            .seconds = now.seconds,
+            .nanoseconds = now.nanosecond,
+            .valid = true
+        };
         if #pattern .Err(error) = set_times(path, .modified = timestamp, .flags = .Modified)
             return fs_failure(state, error);
     }
@@ -89,13 +111,14 @@ native_touch :: (state: *void) -> s32 {
 }
 native_cp :: (state: *void) -> s32 {
     if !valid_path(state, 1) || !valid_path(state, 2) ||
-        !valid_bool(state, 3) || !valid_bool(state, 4)
+       !valid_bool(state, 3) || !valid_bool(state, 4)
         return failure(state, "cp: expected source, destination, recursive and overwrite booleans");
     source := Lua.text(state, 1);
     destination := Lua.text(state, 2);
     policy := ifx boolean(state, 4) Copy_Policy.Overwrite else Copy_Policy.Fail_If_Exists;
     if metadata(source, false) == {
-    case .Err(error); return fs_failure(state, error);
+    case .Err(error);
+        return fs_failure(state, error);
     case .Ok(info);
         if info.kind == .Directory && !boolean(state, 3)
             return failure(state, "cp: directory source requires recursive=true");
@@ -112,8 +135,10 @@ native_mv :: (state: *void) -> s32 {
     if !valid_path(state, 1) || !valid_path(state, 2) || !valid_bool(state, 3)
         return failure(state, "mv: expected source, destination and optional overwrite boolean");
     if rename(Lua.text(state, 1), Lua.text(state, 2), .replace_existing = boolean(state, 3)) == {
-    case .Err(error); return fs_failure(state, error);
-    case .Ok; return success(state);
+    case .Err(error);
+        return fs_failure(state, error);
+    case .Ok;
+        return success(state);
     }
 }
 native_rm :: (state: *void) -> s32 {
@@ -145,7 +170,8 @@ native_stat :: (state: *void) -> s32 {
         return failure(state, "stat: expected a nonempty path and optional follow boolean");
     path := Lua.text(state, 1);
     if metadata(path, boolean(state, 2, true)) == {
-    case .Err(error); return fs_failure(state, error);
+    case .Err(error);
+        return fs_failure(state, error);
     case .Ok(info);
         Lua.create_table(state, 0, 6);
         text_field(state, "path", path);
@@ -159,8 +185,11 @@ native_stat :: (state: *void) -> s32 {
 native_exists :: (state: *void) -> s32 {
     if !valid_path(state, 1) return failure(state, "exists: expected a nonempty path without NUL");
     if exists(Lua.text(state, 1)) == {
-    case .Err(error); return fs_failure(state, error);
-    case .Ok(value); Lua.push_boolean(state, ifx value 1 else 0); return 1;
+    case .Err(error);
+        return fs_failure(state, error);
+    case .Ok(value);
+        Lua.push_boolean(state, ifx value 1 else 0);
+        return 1;
     }
 }
 native_path :: (state: *void) -> s32 {
@@ -199,8 +228,10 @@ native_path :: (state: *void) -> s32 {
     else if operation == "stem" Lua.push_text(state, path_stem(path));
     else if operation == "exists" {
         if exists(path) == {
-        case .Err(error); return fs_failure(state, error);
-        case .Ok(value); Lua.push_boolean(state, ifx value 1 else 0);
+        case .Err(error);
+            return fs_failure(state, error);
+        case .Ok(value);
+            Lua.push_boolean(state, ifx value 1 else 0);
         }
     } else if operation == "normalize" {
         normalized := path_clean(path);
@@ -213,41 +244,69 @@ native_path :: (state: *void) -> s32 {
         defer variables.free();
         if operation == "expand" {
             if path_expand(path) == {
-            case .Err(error); return failure(state, tprint("path.expand: {}", error.kind));
-            case .Ok(value); variables = value; path = variables;
+            case .Err(error);
+                return failure(state, tprint("path.expand: {}", error.kind));
+            case .Ok(value);
+                variables = value;
+                path = variables;
             }
         }
         expanded: str;
         defer expanded.free();
         if uses_home {
-            #pattern ?value := Home.from_home(path) else { return failure(state, Home.unavailable()); };
+            #pattern ?value := Home.from_home(path) else {
+                return failure(state, Home.unavailable());
+            };
             expanded = value;
             path = expanded;
         }
-        if operation == "home" { Lua.push_text(state, path); return 1; }
+        if operation == "home" {
+            Lua.push_text(state, path);
+            return 1;
+        }
         if absolute(path) == {
-        case .Err(error); return fs_failure(state, error);
-        case .Ok(value); defer value.free(); Lua.push_text(state, value);
+        case .Err(error);
+            return fs_failure(state, error);
+        case .Ok(value);
+            defer value.free();
+            Lua.push_text(state, value);
         }
     } else return failure(state, "path: unknown operation");
     return 1;
 }
 
 // C callbacks re-enter a normal Glosso procedure to establish its allocator context.
-callback_mkdir :: (state: *void) -> s32 #c_call { return native_mkdir(state); }
-callback_touch :: (state: *void) -> s32 #c_call { return native_touch(state); }
-callback_cp :: (state: *void) -> s32 #c_call { return native_cp(state); }
-callback_mv :: (state: *void) -> s32 #c_call { return native_mv(state); }
-callback_rm :: (state: *void) -> s32 #c_call { return native_rm(state); }
-callback_stat :: (state: *void) -> s32 #c_call { return native_stat(state); }
-callback_exists :: (state: *void) -> s32 #c_call { return native_exists(state); }
-callback_path :: (state: *void) -> s32 #c_call { return native_path(state); }
+callback_mkdir :: (state: *void) -> s32 #c_call {
+    return native_mkdir(state);
+}
+callback_touch :: (state: *void) -> s32 #c_call {
+    return native_touch(state);
+}
+callback_cp :: (state: *void) -> s32 #c_call {
+    return native_cp(state);
+}
+callback_mv :: (state: *void) -> s32 #c_call {
+    return native_mv(state);
+}
+callback_rm :: (state: *void) -> s32 #c_call {
+    return native_rm(state);
+}
+callback_stat :: (state: *void) -> s32 #c_call {
+    return native_stat(state);
+}
+callback_exists :: (state: *void) -> s32 #c_call {
+    return native_exists(state);
+}
+callback_path :: (state: *void) -> s32 #c_call {
+    return native_path(state);
+}
 bind :: (state: *void, name: str, callback: Lua.Callback) {
     Lua.push_callback(state, callback, 0);
     Lua.set_field(state, -2, name.data);
 }
 
 #public {
+
 // The caller owns the existing native table on the Lua stack.
 install :: (state: *void) {
     bind(state, "mkdir", callback_mkdir);
@@ -259,4 +318,5 @@ install :: (state: *void) {
     bind(state, "exists", callback_exists);
     bind(state, "path", callback_path);
 }
+
 }

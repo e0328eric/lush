@@ -46,7 +46,8 @@ windows_extension :: (name: str, extensions: str) -> str {
     if dot == 0 return "";
     suffix := name[dot - 1..];
     if !same_name(suffix, ".exe") && !same_name(suffix, ".com") &&
-        !same_name(suffix, ".bat") && !same_name(suffix, ".cmd") return "";
+       !same_name(suffix, ".bat") && !same_name(suffix, ".cmd")
+        return "";
     start: ssize = 0;
     while start <= extensions.count {
         end := start;
@@ -81,7 +82,8 @@ executable_path :: (path: str, extensions: str) -> bool {
         return exists(path).unwrap_or(false) && !is_directory(path).unwrap_or(false);
     } else {
         if metadata(path, true) == {
-        case .Err; return false;
+        case .Err;
+            return false;
         case .Ok(info);
             if info.kind != .Regular return false;
         }
@@ -91,7 +93,8 @@ executable_path :: (path: str, extensions: str) -> bool {
 
 append_directory :: (names: *[..]str, directory: str, prefix: str, extensions: str) {
     if read_directory(directory) == {
-    case .Err; return;
+    case .Err;
+        return;
     case .Ok(entries);
         defer entries.free();
         for entry: entries.entries {

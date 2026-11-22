@@ -16,7 +16,11 @@
 #import "Context";
 Case_Directory :: #import "windows_copy_case.glo";
 
-Paths :: struct { source: str; destination: str; regular: bool; }
+Paths :: struct {
+    source: str;
+    destination: str;
+    regular: bool;
+}
 Paths ::: instance Send {}
 Paths ::: instance Freeable {
     free :: (paths: *Paths) {
@@ -44,14 +48,21 @@ Listing ::: #private {
         return #self.cursor.next();
     }
     close :: (*#self) -> Fs_Error!void {
-        if #pattern ?entries = value_take(&#self.checked) entries.free();
-        else if #self.cursor.valid _ := #self.cursor.close()?;
+        if      #pattern ?entries = value_take(&#self.checked) entries.free();
+        else if #self.cursor.valid                             _ := #self.cursor.close()?;
         return .Ok;
     }
 }
 
-Folder :: struct { paths: Paths; listing: Listing; info: Metadata; }
-Restore :: struct { paths: Paths; info: Metadata; }
+Folder :: struct {
+    paths: Paths;
+    listing: Listing;
+    info: Metadata;
+}
+Restore :: struct {
+    paths: Paths;
+    info: Metadata;
+}
 
 Job :: struct {
     policy: Copy_Policy;
@@ -69,7 +80,9 @@ credit :: (job: *Job, paths: Paths, bytes: s64) {
         if #pattern ?counter = job.confirmed_bytes _ := counter.fetch_add(bytes);
     }
     // A caller may use a plain cumulative count, even with several workers.
-    #pattern .Ok(lock) := job.notifications.lock() else { return; };
+    #pattern .Ok(lock) := job.notifications.lock() else {
+        return;
+    };
     defer lock.unlock();
     job.completed += 1;
     if #pattern ?notify = job.observer.progress
@@ -95,19 +108,47 @@ fail :: (job: *Job, error: Fs_Error, paths: Paths) {
 
 #if OUT.os == .Windows && size_of(usize) == 8 {
     kernel :: #library "kernel32";
-    Transfer :: #fn_ptr(total: s64, transferred: s64, stream_size: s64, stream_transferred: s64,
-        stream_number: u32, reason: u32, source: ssize, destination: ssize, data: *void) -> u32 #c_call;
-    copy_ex :: (source: [*]const u16, destination: [*]const u16, callback: ?Transfer, data: *void,
-        cancelled: ?*s32, flags: u32) -> s32 #foreign kernel "CopyFileExW";
+    Transfer :: #fn_ptr(
+        total: s64,
+        transferred: s64,
+        stream_size: s64,
+        stream_transferred: s64,
+        stream_number: u32,
+        reason: u32,
+        source: ssize,
+        destination: ssize,
+        data: *void
+    ) -> u32 #c_call;
+    copy_ex :: (
+        source: [*]const u16,
+        destination: [*]const u16,
+        callback: ?Transfer,
+        data: *void,
+        cancelled: ?*s32,
+        flags: u32
+    ) -> s32 #foreign kernel "CopyFileExW";
     last_error :: () -> u32 #foreign kernel "GetLastError";
     get_file_time :: (handle: ssize, creation: ?*u64, access: ?*u64, modified: ?*u64) -> s32
-        #foreign kernel "GetFileTime";
+    #foreign kernel "GetFileTime";
     set_file_time :: (handle: ssize, creation: ?*u64, access: ?*u64, modified: ?*u64) -> s32
-        #foreign kernel "SetFileTime";
+    #foreign kernel "SetFileTime";
 
-    Transfer_State :: struct { bytes: ?*Atomic(s64); last: s64; access_restored: bool; }
-    transferred :: (total: s64, done: s64, stream_size: s64, stream_done: s64, stream_number: u32,
-        reason: u32, source: ssize, destination: ssize, data: *void) -> u32 #c_call {
+    Transfer_State :: struct {
+        bytes: ?*Atomic(s64);
+        last: s64;
+        access_restored: bool;
+    }
+    transferred :: (
+        total: s64,
+        done: s64,
+        stream_size: s64,
+        stream_done: s64,
+        stream_number: u32,
+        reason: u32,
+        source: ssize,
+        destination: ssize,
+        data: *void
+    ) -> u32 #c_call {
         state := cast(*Transfer_State) data;
         // The inventory reports only the main data stream. Keep alternate
         // stream sizes out of its percentage.
@@ -141,8 +182,12 @@ copy_data :: (job: *Job, paths: Paths) -> Fs_Error!s64 {
                 if !state.access_restored {
                     info := metadata(paths.source, false)?;
                     if info.accessed.valid {
-                        if #pattern .Err(error) = set_times(paths.destination, .accessed = info.accessed,
-                            .flags = .Accessed, .follow_symlink = false) {
+                        if #pattern .Err(error) = set_times(
+                            paths.destination,
+                            .accessed = info.accessed,
+                            .flags = .Accessed,
+                            .follow_symlink = false
+                        ) {
                             if preserve_error_is_fatal(error) return .Err(error);
                         }
                     }
@@ -162,8 +207,10 @@ copy_data :: (job: *Job, paths: Paths) -> Fs_Error!s64 {
 copy_leaf :: (job: *Job, paths: Paths) {
     #temp_scope {
         if copy_data(job, paths) == {
-        case .Ok(bytes); credit(job, paths, bytes);
-        case .Err(error); fail(job, error, paths);
+        case .Ok(bytes);
+            credit(job, paths, bytes);
+        case .Err(error);
+            fail(job, error, paths);
         }
     }
 }
@@ -171,10 +218,16 @@ copy_leaf :: (job: *Job, paths: Paths) {
 worker :: (data: *void) -> ?*void #c_call {
     #push_allocator(heap_allocator());
     job := cast(*Job) data;
-    #pattern ?queue := job.work else { return null; };
+    #pattern ?queue := job.work else {
+        return null;
+    };
     while !job.failed.load() {
-        #pattern .Ok(next) := queue.recv() else { break; };
-        #pattern ?paths := next else { break; };
+        #pattern .Ok(next) := queue.recv() else {
+            break;
+        };
+        #pattern ?paths := next else {
+            break;
+        };
         defer paths.free();
         if !job.failed.load() copy_leaf(job, paths);
     }
@@ -209,7 +262,7 @@ prepare_folder :: (job: *Job, paths: Paths, info: Metadata) -> Fs_Error!Listing 
     created := false;
     if metadata(paths.destination, false) == {
     case .Ok(previous);
-        if previous.kind != .Directory return .Err(Fs_Error.make_error(.Not_A_Directory, .Copy));
+        if previous.kind != .Directory   return .Err(Fs_Error.make_error(.Not_A_Directory, .Copy));
         if job.policy == .Fail_If_Exists return .Err(Fs_Error.make_error(.Already_Exists, .Copy));
     case .Err(error);
         if error.kind != .Not_Found return .Err(error);
@@ -236,7 +289,10 @@ copy_entries :: (job: *Job, source: str, destination: str, info: Metadata, resto
     }
     root := Paths.{ .source = source.clone(), .destination = destination.clone() };
     if prepare_folder(job, root, info) == {
-    case .Err(error); fail(job, error, root); root.free(); return;
+    case .Err(error);
+        fail(job, error, root);
+        root.free();
+        return;
     case .Ok(listing);
         // Preserve the caller's path semantics for the root operation, then
         // anchor its descendants at the existing native directories. Windows
@@ -260,7 +316,9 @@ copy_entries :: (job: *Job, source: str, destination: str, info: Metadata, resto
         #temp_scope {
             folder := &stack[stack.count - 1];
             if folder.listing.next() == {
-            case .Err(error); fail(job, error, folder.paths); return;
+            case .Err(error);
+                fail(job, error, folder.paths);
+                return;
             case .Ok(next);
                 if next == {
                 case null;
@@ -273,12 +331,17 @@ copy_entries :: (job: *Job, source: str, destination: str, info: Metadata, resto
                     restore.push(.{ .paths = folder.paths, .info = folder.info });
                     stack.count -= 1;
                 case ?entry;
-                    paths := Paths.{ .source = path_join(folder.paths.source, entry.name),
-                        .destination = path_join(folder.paths.destination, entry.name) };
+                    paths := Paths.{
+                        .source = path_join(folder.paths.source, entry.name),
+                        .destination = path_join(folder.paths.destination, entry.name)
+                    };
                     kind := entry.kind;
                     if kind == .Directory || !entry.has_kind {
                         if metadata(paths.source, false) == {
-                        case .Err(error); fail(job, error, paths); paths.free(); return;
+                        case .Err(error);
+                            fail(job, error, paths);
+                            paths.free();
+                            return;
                         case .Ok(child);
                             kind = child.kind;
                             if kind == .Directory {
@@ -287,15 +350,25 @@ copy_entries :: (job: *Job, source: str, destination: str, info: Metadata, resto
                                         id := ancestor.info.file_id;
                                         if id.valid && id.high == child.file_id.high && id.low == child.file_id.low &&
                                             id.file_high == child.file_id.file_high {
-                                            fail(job, Fs_Error.make_error(.Too_Many_Links, .Copy), paths);
+                                            fail(
+                                                job,
+                                                Fs_Error.make_error(.Too_Many_Links, .Copy),
+                                                paths
+                                            );
                                             paths.free();
                                             return;
                                         }
                                     }
                                 }
                                 if prepare_folder(job, paths, child) == {
-                                case .Err(error); fail(job, error, paths); paths.free(); return;
-                                case .Ok(listing); stack.push(.{ .paths = paths, .listing = listing, .info = child });
+                                case .Err(error);
+                                    fail(job, error, paths);
+                                    paths.free();
+                                    return;
+                                case .Ok(listing);
+                                    stack.push(
+                                        .{ .paths = paths, .listing = listing, .info = child }
+                                    );
                                 }
                                 continue;
                             }
@@ -331,7 +404,12 @@ restore_folder :: (item: *Restore) -> Fs_Error!void {
     if item.info.accessed.valid flags = flags | Time_Update_Flags.Accessed;
     if item.info.modified.valid flags = flags | Time_Update_Flags.Modified;
     if flags != .None {
-        if #pattern .Err(error) = set_times(item.paths.destination, item.info.accessed, item.info.modified, flags) {
+        if #pattern .Err(error) = set_times(
+            item.paths.destination,
+            item.info.accessed,
+            item.info.modified,
+            flags
+        ) {
             if preserve_error_is_fatal(error) return .Err(error);
         }
     }
@@ -341,8 +419,14 @@ restore_folder :: (item: *Restore) -> Fs_Error!void {
     return .Ok;
 }
 
-#public copy :: (source: str, destination: str, info: Metadata, policy: Copy_Policy,
-    observer: Copy_Observer = .{}, confirmed_bytes: ?*Atomic(s64) = null) -> Fs_Error!ssize {
+#public copy :: (
+    source: str,
+    destination: str,
+    info: Metadata,
+    policy: Copy_Policy,
+    observer: Copy_Observer = .{},
+    confirmed_bytes: ?*Atomic(s64) = null
+) -> Fs_Error!ssize {
     // The enumerator owns queued paths until send; a worker then frees them.
     #push_allocator(heap_allocator());
     if #pattern .Err(error) = check_destination(source, destination)
@@ -353,13 +437,21 @@ restore_folder :: (item: *Restore) -> Fs_Error!void {
     if #pattern .Ok(queue) = Channel(Paths).new() {
         job.work = ?queue;
         for index: 0..6 {
-            #pattern .Ok(thread) := Thread.spawn(worker, &job) else { break; };
+            #pattern .Ok(thread) := Thread.spawn(worker, &job) else {
+                break;
+            };
             threads.push(thread);
         }
-        if threads.count == 0 { queue.free(); job.work = null; }
+        if threads.count == 0 {
+            queue.free();
+            job.work = null;
+        }
     }
     restore: [..]Restore;
-    defer { for *item: restore item.paths.free(); restore.free_storage(); }
+    defer {
+        for *item: restore item.paths.free();
+        restore.free_storage();
+    }
     copy_entries(&job, source, destination, info, &restore);
     if #pattern ?queue = job.work {
         queue.close();
@@ -381,8 +473,12 @@ restore_folder :: (item: *Restore) -> Fs_Error!void {
         if !observer.child_errors return .Err(error.with_path(source, destination));
         defer error.path.free(heap_allocator());
         defer error.other_path.free(heap_allocator());
-        return .Err(error.with_path(error.path.clone(context.temp_allocator).into_temporary(),
-            error.other_path.clone(context.temp_allocator).into_temporary()));
+        return .Err(
+            error.with_path(
+                error.path.clone(context.temp_allocator).into_temporary(),
+                error.other_path.clone(context.temp_allocator).into_temporary()
+            )
+        );
     }
     return .Ok(job.completed);
 }

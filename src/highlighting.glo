@@ -24,14 +24,22 @@ mask :: (state: *void, source: str) -> str {
 
 color :: (category: u8) -> str {
     if category == {
-    case 49; return "\x1b[95m"; // Keywords and literals.
-    case 50; return "\x1b[32m"; // Strings.
-    case 51; return "\x1b[33m"; // Numbers.
-    case 52; return "\x1b[90m"; // Comments, without dim (reserved for suggestions).
-    case 53; return "\x1b[36m"; // Calls and builtins.
-    case 54; return "\x1b[94m"; // Operators and punctuation.
-    case 55; return "\x1b[91m"; // Lexical errors.
-    else; return "\x1b[39m";
+    case 49;
+        return "\x1b[95m"; // Keywords and literals.
+    case 50;
+        return "\x1b[32m"; // Strings.
+    case 51;
+        return "\x1b[33m"; // Numbers.
+    case 52;
+        return "\x1b[90m"; // Comments, without dim (reserved for suggestions).
+    case 53;
+        return "\x1b[36m"; // Calls and builtins.
+    case 54;
+        return "\x1b[94m"; // Operators and punctuation.
+    case 55;
+        return "\x1b[91m"; // Lexical errors.
+    else;
+        return "\x1b[39m";
     }
 }
 

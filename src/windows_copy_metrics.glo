@@ -28,21 +28,36 @@
         name: [260]u16;
         alternate: [14]u16;
     }
-    find_first :: (pattern: [*]const u16, level: s32, data: *Find_Data,
-        search: s32, filter: ?*void, flags: u32) -> ssize #foreign kernel "FindFirstFileExW";
+    find_first :: (
+        pattern: [*]const u16,
+        level: s32,
+        data: *Find_Data,
+        search: s32,
+        filter: ?*void,
+        flags: u32
+    ) -> ssize #foreign kernel "FindFirstFileExW";
     find_next :: (handle: ssize, data: *Find_Data) -> s32 #foreign kernel "FindNextFileW";
     find_close :: (handle: ssize) -> s32 #foreign kernel "FindClose";
     last_error :: () -> u32 #foreign kernel "GetLastError";
 
     Io_Counters :: struct #c_call {
-        read_operations: u64; write_operations: u64; other_operations: u64;
-        read_bytes: u64; written_bytes: u64; other_bytes: u64;
+        read_operations: u64;
+        write_operations: u64;
+        other_operations: u64;
+        read_bytes: u64;
+        written_bytes: u64;
+        other_bytes: u64;
     }
     current_process :: () -> ssize #foreign kernel "GetCurrentProcess";
     io_counters :: (process: ssize, counters: *Io_Counters) -> s32 #foreign kernel "GetProcessIoCounters";
 
-    scan_directory :: (folder: str, pending: *[..]str, total: *s64, cancel: *Atomic(bool),
-        scanned: *Atomic(s64)) -> bool {
+    scan_directory :: (
+        folder: str,
+        pending: *[..]str,
+        total: *s64,
+        cancel: *Atomic(bool),
+        scanned: *Atomic(s64)
+    ) -> bool {
         pattern := path_join(folder, "*");
         defer pattern.free();
         wide := pattern.cstring16_from_string();
@@ -55,7 +70,9 @@
         defer _ := find_close(handle);
         while true {
             if cancel.load() return false;
-            dot := data.name[0] == 46 && (data.name[1] == 0 || (data.name[1] == 46 && data.name[2] == 0));
+            dot := data.name[0] == 46 && (
+                data.name[1] == 0 || (data.name[1] == 46 && data.name[2] == 0)
+            );
             if !dot {
                 _ := scanned.fetch_add(1);
                 // Symbolic links and junctions set the name-surrogate bit.
@@ -66,13 +83,17 @@
                         length: ssize;
                         while length < data.name.count && data.name[length] != 0 length += 1;
                         units: []const u16 = data.name[..length];
-                        #pattern ?name := units.utf16_from_units() else { return false; };
-                        #pattern ?text := name.to_string() else { return false; };
+                        #pattern ?name := units.utf16_from_units() else {
+                            return false;
+                        };
+                        #pattern ?text := name.to_string() else {
+                            return false;
+                        };
                         defer text.free();
                         pending.push(path_join(folder, text));
                     } else {
                         size := (cast(u64) data.size_high << 32) | cast(u64) data.size_low;
-                        if size > cast(u64) (16#7fff_ffff_ffff_ffff - total.*) return false;
+                        if size > cast(u64)(16#7fff_ffff_ffff_ffff - total.*) return false;
                         total.* += cast(s64) size;
                     }
                 }
@@ -90,9 +111,15 @@
         // GetFinalPathNameByHandleW supplies a fully qualified \\?\ path,
         // including the UNC form, for all descendant searches.
         root, code := os_canonical_path(source);
-        if code != 0 { root.free(); return -1; }
+        if code != 0 {
+            root.free();
+            return -1;
+        }
         pending: [..]str;
-        defer { for path: pending path.free(); pending.free(); }
+        defer {
+            for path: pending path.free();
+            pending.free();
+        }
         pending.push(root);
         scanned.store(1);
         total: s64;
@@ -100,7 +127,8 @@
             folder := array_pop_last(&pending);
             defer folder.free();
             #temp_scope {
-                if cancel.load() || !scan_directory(folder, &pending, &total, cancel, scanned) return -1;
+                if cancel.load() || !scan_directory(folder, &pending, &total, cancel, scanned)
+                    return -1;
             }
         }
         return total;
@@ -111,7 +139,11 @@
     #if OUT.os == .Windows {
         counters: Io_Counters;
         if io_counters(current_process(), &counters) != 0
-            return .{ .read = counters.read_bytes, .written = counters.written_bytes, .valid = true };
+            return .{
+                .read = counters.read_bytes,
+                .written = counters.written_bytes,
+                .valid = true
+            };
     }
     return .{};
 }
@@ -119,7 +151,9 @@
 // Both directions of a transfer must have advanced. This keeps progress
 // messages written to stderr from being counted as additional file data.
 #public transferred :: (first: Io_Sample, current: Io_Sample) -> s64 {
-    if !first.valid || !current.valid || current.read < first.read || current.written < first.written return -1;
+    if !first.valid || !current.valid || current.read < first.read ||
+       current.written < first.written
+        return -1;
     read := current.read - first.read;
     written := current.written - first.written;
     bytes := ifx read < written read else written;

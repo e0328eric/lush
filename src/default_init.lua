@@ -13,7 +13,7 @@
 -- descriptor or builder here to override a name without loading its file.
 lush.config.themes = lush.config.themes or {}
 lush.config.theme = nil -- Set a filename stem from the themes directory to select it.
-lush.config.theme_options = {icons = true, git = true, time = true}
+lush.config.theme_options = { icons = true, git = true, time = true }
 -- Set icons = false above for an ASCII prompt without a Nerd Font.
 -- A prompt string or callback overrides the selected theme:
 -- lush.config.prompt = function() return pwd() .. " > " end
@@ -27,7 +27,7 @@ lush.config.theme_options = {icons = true, git = true, time = true}
 -- }
 
 lush.config.history_limit = 1000
-lush.config.autosuggestions = true  -- Right Arrow accepts a suggestion.
+lush.config.autosuggestions = true -- Right Arrow accepts a suggestion.
 lush.config.syntax_highlighting = true
 
 -- History defaults to history.jsonl beside this file. An unset history_file
@@ -42,5 +42,7 @@ lush.config.syntax_highlighting = true
 -- Keep personal aliases in an optional, trusted aliases.lua beside this file.
 if type(lush.config_dir) == "string" and lush.config_dir ~= "" then
     local aliases_file = path.join(lush.config_dir, "aliases.lua")
-    if exists(aliases_file) then source(aliases_file) end
+    if exists(aliases_file) then
+        source(aliases_file)
+    end
 end

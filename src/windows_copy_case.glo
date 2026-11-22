@@ -14,16 +14,22 @@
     #import "Format";
 
     kernel :: #library "kernel32";
-    open :: (path: [*]const u16, access: u32, share: u32, security: ?*void,
-        creation: u32, flags: u32, template: ?*void) -> ssize #foreign kernel "CreateFileW";
+    open :: (
+        path: [*]const u16,
+        access: u32,
+        share: u32,
+        security: ?*void,
+        creation: u32,
+        flags: u32,
+        template: ?*void
+    ) -> ssize #foreign kernel "CreateFileW";
     close :: (handle: ssize) -> s32 #foreign kernel "CloseHandle";
     last_error :: () -> u32 #foreign kernel "GetLastError";
     get_info :: (handle: ssize, kind: u32, value: *u32, size: u32) -> s32
-        #foreign kernel "GetFileInformationByHandleEx";
+    #foreign kernel "GetFileInformationByHandleEx";
     set_info :: (handle: ssize, kind: u32, value: *u32, size: u32) -> s32
-        #foreign kernel "SetFileInformationByHandle";
-    compare_names :: (a: [*]const u16, a_len: s32, b: [*]const u16, b_len: s32,
-        ignore_case: s32) -> s32 #foreign kernel "CompareStringOrdinal";
+    #foreign kernel "SetFileInformationByHandle";
+    compare_names :: (a: [*]const u16, a_len: s32, b: [*]const u16, b_len: s32, ignore_case: s32) -> s32 #foreign kernel "CompareStringOrdinal";
 
     FILE_CASE_SENSITIVE_INFO :: 23;
 
@@ -35,12 +41,15 @@
             full := absolute(path, context.temp_allocator)?;
             if full.count >= 248 {
                 full_root := path_parse_root(full);
-                if full_root.kind == .Windows_Drive_Absolute text = tprint("\\\\?\\{}", full);
-                else if full_root.kind == .Windows_Unc text = tprint("\\\\?\\UNC\\{}", full[2..]);
+                if full_root.kind == .Windows_Drive_Absolute
+                    text = tprint("\\\\?\\{}", full);
+                else if full_root.kind == .Windows_Unc
+                    text = tprint("\\\\?\\UNC\\{}", full[2..]);
             }
         }
         wide := text.cstring16_from_string(context.temp_allocator);
-        if cast(usize) wide.data == 0 return .Err(Fs_Error.make_error(.Out_Of_Memory, .Copy, 0, path));
+        if cast(usize) wide.data == 0
+            return .Err(Fs_Error.make_error(.Out_Of_Memory, .Copy, 0, path));
         return .Ok(wide);
     }
 
@@ -69,7 +78,8 @@
     change_flags :: (path: str, flags: u32) -> s64 {
         // WRITE_ATTRIBUTES, ADD_FILE, ADD_SUBDIRECTORY and DELETE_CHILD.
         if directory_handle(path, 16#146) == {
-        case .Err(error); return ifx error.os_code != 0 error.os_code else 8;
+        case .Err(error);
+            return ifx error.os_code != 0 error.os_code else 8;
         case .Ok(handle);
             defer _ := close(handle);
             if set_info(handle, FILE_CASE_SENSITIVE_INFO, &flags, 4) == 0 return last_error();
@@ -77,7 +87,10 @@
         }
     }
 
-    Name :: struct { text: str; wide: cstring16; }
+    Name :: struct {
+        text: str;
+        wide: cstring16;
+    }
 
     compare :: (a: *const Name, b: *const Name) -> Ordering {
         return compare_names(a.wide.data, -1, b.wide.data, -1, 1) <=> 2;
@@ -86,8 +99,7 @@
     // An existing merge target keeps its own lookup policy. If a newly
     // created target could not adopt the source's flag, the same check lets
     // representable trees copy and detects conflicting names before writes.
-    check_names :: (source: str, destination: str, code: s64,
-        checked_entries: ?*?Directory_List) -> Fs_Error!void {
+    check_names :: (source: str, destination: str, code: s64, checked_entries: ?*?Directory_List) -> Fs_Error!void {
         entries := read_directory(source)?;
         defer entries.free();
         names: [..]Name;
@@ -97,7 +109,8 @@
         }
         for entry: entries.entries {
             wide := entry.name.cstring16_from_string();
-            if cast(usize) wide.data == 0 return .Err(Fs_Error.make_error(.Out_Of_Memory, .Copy, 0, source, destination));
+            if cast(usize) wide.data == 0
+                return .Err(Fs_Error.make_error(.Out_Of_Memory, .Copy, 0, source, destination));
             names.push(.{ .text = entry.name, .wide = wide });
         }
         _ := names[..].pdq_sort_by(compare);
@@ -115,15 +128,20 @@
     }
 }
 
-#public prepare :: (source: str, destination: str, newly_created: bool,
-    checked_entries: ?*?Directory_List = null) -> Fs_Error!void {
+#public prepare :: (
+    source: str,
+    destination: str,
+    newly_created: bool,
+    checked_entries: ?*?Directory_List = null
+) -> Fs_Error!void {
     #if OUT.os == .Windows {
         source_flags := flags_of(source)?;
         dest_flags := flags_of(destination)?;
         src := source_flags.unwrap_or(0) & 1;
         dst := dest_flags.unwrap_or(0) & 1;
         if src == dst {
-            if dst == 0 && source_flags == null return check_names(source, destination, 0, checked_entries);
+            if dst == 0 && source_flags == null
+                return check_names(source, destination, 0, checked_entries);
             return .Ok;
         }
         code: s64;

@@ -31,7 +31,9 @@ push_children :: (root: *Sandbox, relative: str, pending: *[..]Pending) -> Fs_Er
     start := pending.*.count;
     while true {
         next := directory.next()?;
-        #pattern ?entry := next else { break; };
+        #pattern ?entry := next else {
+            break;
+        };
         child := ifx relative == "." entry.name.clone() else path_join(relative, entry.name);
         pending.push(.{ .relative = child });
     }
@@ -39,7 +41,11 @@ push_children :: (root: *Sandbox, relative: str, pending: *[..]Pending) -> Fs_Er
     return directory.close();
 }
 
-Step :: enum { Listed; Skipped; Removed; }
+Step :: enum {
+    Listed;
+    Skipped;
+    Removed;
+}
 
 remove_entry :: (root: *Sandbox, pending: *[..]Pending) -> Fs_Error!Step {
     top := pending.*.count - 1;
@@ -48,7 +54,8 @@ remove_entry :: (root: *Sandbox, pending: *[..]Pending) -> Fs_Error!Step {
         directory := relative == ".";
         if !directory {
             if root.metadata(relative) == {
-            case .Ok(info); directory = info.kind == .Directory;
+            case .Ok(info);
+                directory = info.kind == .Directory;
             case .Err(error);
                 // The object may have disappeared since it was listed.
                 if error.kind == .Not_Found return .Ok(.Skipped);
@@ -84,7 +91,11 @@ remove_contents :: (root: *Sandbox, target: str, notify: Progress, state: *void)
         case .Err(error);
             full := target;
             if relative != "." {
-                #if OUT.os == .Windows full = path_join(target, relative, .allocator = context.temp_allocator);
+                #if OUT.os == .Windows full = path_join(
+                    target,
+                    relative,
+                    .allocator = context.temp_allocator
+                );
                 else full = tprint("{}/{}", target, relative);
             }
             error.completed += count;
@@ -103,19 +114,27 @@ remove_contents :: (root: *Sandbox, target: str, notify: Progress, state: *void)
 }
 
 #public remove_tree :: (path: str, notify: ?Progress, state: *void) -> Fs_Error!ssize {
-    #pattern ?update := notify else { return remove_all(path); };
+    #pattern ?update := notify else {
+        return remove_all(path);
+    };
     update(state, 0);
     // A trailing separator must never turn a final directory symlink into
     // a tree to descend into. Delegate single entries and invalid spellings
     // to remove_all, which handles these cases without a traversal.
     root_name := path_parse_root(path);
     end := path.count;
-    while end > root_name.rest_start && path_is_separator(path[end - 1], .Native, root_name.verbatim)
+    while end > root_name.rest_start && path_is_separator(
+        path[end - 1],
+        .Native,
+        root_name.verbatim
+    )
         end -= 1;
     target := path[..end];
     name := path_basename(target);
     if name == "." || name == ".." || path.has_nul() return remove_all(path);
-    #pattern .Ok(info) := metadata(target, false) else { return remove_all(path); };
+    #pattern .Ok(info) := metadata(target, false) else {
+        return remove_all(path);
+    };
     if info.kind != .Directory {
         count := remove_all(path)?;
         update(state, count);
@@ -128,8 +147,10 @@ remove_contents :: (root: *Sandbox, target: str, notify: Progress, state: *void)
         opened := root.metadata(".")?;
         before := info.file_id;
         after := opened.file_id;
-        if before.valid && after.valid && (before.high != after.high || before.low != after.low ||
-            before.file_high != after.file_high)
+        if before.valid && after.valid &&
+           (
+               before.high != after.high || before.low != after.low || before.file_high != after.file_high
+           )
             return .Err(Fs_Error.make_error(.Not_Found, .Open_Directory, 0, target));
         count = remove_contents(&root, target, update, state)?;
     }

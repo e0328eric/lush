@@ -5,36 +5,50 @@
 #insert #comptime static_bindings_source(.["lua_State"]);
 
 #public {
+
 Callback :: #fn_ptr(state: *void) -> s32 #c_call;
 new_state :: () -> ?*void #foreign lua "luaL_newstate";
 close :: (state: *void) #foreign lua "lua_close";
 open_selected_libraries :: (state: *void, loaded: s32, preloaded: s32)
-    #foreign lua "luaL_openselectedlibs";
-open_libraries :: (state: *void) { open_selected_libraries(state, -1, 0); }
-load_buffer :: (state: *void, data: [*]const u8, count: usize,
-    name: [*]const u8, mode: ?[*]const u8) -> s32 #foreign lua "luaL_loadbufferx";
-call :: (state: *void, args: s32, results: s32, handler: s32,
-    call_context: ssize, continuation: usize) -> s32 #foreign lua "lua_pcallk";
+#foreign lua "luaL_openselectedlibs";
+open_libraries :: (state: *void) {
+    open_selected_libraries(state, -1, 0);
+}
+load_buffer :: (
+    state: *void,
+    data: [*]const u8,
+    count: usize,
+    name: [*]const u8,
+    mode: ?[*]const u8
+) -> s32 #foreign lua "luaL_loadbufferx";
+call :: (
+    state: *void,
+    args: s32,
+    results: s32,
+    handler: s32,
+    call_context: ssize,
+    continuation: usize
+) -> s32 #foreign lua "lua_pcallk";
 get_top :: (state: *void) -> s32 #foreign lua "lua_gettop";
 set_top :: (state: *void, index: s32) #foreign lua "lua_settop";
 value_type :: (state: *void, index: s32) -> s32 #foreign lua "lua_type";
 to_string :: (state: *void, index: s32, count: ?*usize) -> ?[*]const u8
-    #foreign lua "lua_tolstring";
+#foreign lua "lua_tolstring";
 to_integer :: (state: *void, index: s32, valid: ?*s32) -> s64
-    #foreign lua "lua_tointegerx";
+#foreign lua "lua_tointegerx";
 to_boolean :: (state: *void, index: s32) -> s32 #foreign lua "lua_toboolean";
 push_nil :: (state: *void) #foreign lua "lua_pushnil";
 push_boolean :: (state: *void, value: s32) #foreign lua "lua_pushboolean";
 push_integer :: (state: *void, value: s64) #foreign lua "lua_pushinteger";
 push_string :: (state: *void, data: [*]const u8, count: usize)
-    #foreign lua "lua_pushlstring";
+#foreign lua "lua_pushlstring";
 push_callback :: (state: *void, callback: Callback, upvalues: s32)
-    #foreign lua "lua_pushcclosure";
+#foreign lua "lua_pushcclosure";
 create_table :: (state: *void, array: s32, records: s32) #foreign lua "lua_createtable";
 get_global :: (state: *void, name: [*]const u8) -> s32 #foreign lua "lua_getglobal";
 set_global :: (state: *void, name: [*]const u8) #foreign lua "lua_setglobal";
 get_field :: (state: *void, index: s32, name: [*]const u8) -> s32
-    #foreign lua "lua_getfield";
+#foreign lua "lua_getfield";
 set_field :: (state: *void, index: s32, name: [*]const u8) #foreign lua "lua_setfield";
 raw_length :: (state: *void, index: s32) -> usize #foreign lua "lua_rawlen";
 raw_get_integer :: (state: *void, index: s32, key: s64) -> s32 #foreign lua "lua_rawgeti";
@@ -52,5 +66,8 @@ text :: (state: *void, index: s32) -> str {
 push_text :: (state: *void, value: str) {
     push_string(state, value.data, cast(usize) value.count);
 }
-pop :: (state: *void, count: s32 = 1) { set_top(state, -count - 1); }
+pop :: (state: *void, count: s32 = 1) {
+    set_top(state, -count - 1);
+}
+
 }
